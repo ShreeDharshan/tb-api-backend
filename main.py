@@ -11,17 +11,17 @@ app = FastAPI()
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
+    allow_origin_regex="https?://.*",
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
-    allow_origin_regex="https?://.*",
 )
 
-#
 app.include_router(report_router)
 app.include_router(alarm_router)
 
-TB_HOST = "http://localhost:8080"
+# ✅ Changed for cloud deployment
+TB_HOST = "https://thingsboard.cloud"
 
 @app.get("/my_devices/")
 def get_my_devices(authorization: str = Header(...)):
