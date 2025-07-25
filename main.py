@@ -1,13 +1,23 @@
-# main.py
 from fastapi import FastAPI, Header, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, JSONResponse
+from fastapi.exceptions import RequestValidationError
+from fastapi.encoders import jsonable_encoder
+from starlette.requests import Request
 from report_logic import router as report_router, extract_jwt_user_info
 from alarm_logic import router as alarm_router
 import os
 import requests
+import logging
 
+# === Logging config ===
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+# === FastAPI setup ===
 app = FastAPI()
+
+# === CORS for ThingsBoard dashboard ===
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -17,12 +27,26 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# === API Routers ===
 app.include_router(report_router)
 app.include_router(alarm_router)
 
-# ✅ Changed for cloud deployment
+# === Cloud ThingsBoard host ===
 TB_HOST = "https://thingsboard.cloud"
 
+# === Global handler for FastAPI validation errors (422) ===
+@app.exception_handler(RequestValidationError)
+async def validation_exception_handler(request: Request, exc: RequestValidationError):
+    logger.error(f"[VALIDATION ERROR] {exc}")
+    return JSONResponse(
+        status_code=422,
+        content=jsonable_encoder({
+            "detail": exc.errors(),
+            "body": exc.body
+        }),
+    )
+
+# === Device list for widgets ===
 @app.get("/my_devices/")
 def get_my_devices(authorization: str = Header(...)):
     if not authorization.startswith("Bearer "):
@@ -46,6 +70,7 @@ def get_my_devices(authorization: str = Header(...)):
     devices = resp.json().get("data", [])
     return [{"name": d["name"], "id": d["id"]["id"]} for d in devices]
 
+# === XLS download endpoint ===
 @app.get("/download/{filename}")
 def download_csv(filename: str):
     file_path = os.path.join(os.getcwd(), filename)
