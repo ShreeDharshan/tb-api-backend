@@ -7,16 +7,17 @@ import os
 from openpyxl.worksheet.table import Table, TableStyleInfo
 from openpyxl.utils import get_column_letter
 
-TB_HOST = "http://localhost:8080"
+# ✅ Cloud deployment uses ThingsBoard Cloud
+TB_HOST = "https://thingsboard.cloud"
+
 router = APIRouter()
 
 class ReportRequest(BaseModel):
-    device_name:   str
-    data_types:    list[str]
+    device_name:    str
+    data_types:     list[str]
     include_alarms: bool
-    start_date:    str 
-    end_date:      str  
-
+    start_date:     str 
+    end_date:       str  
 
 VIBE_KEY_MAP = {
     'x_vibration': 'x_vibe',
@@ -101,16 +102,13 @@ def generate_report(request: ReportRequest, authorization: str = Header(...)):
     customer_id = user.get("customerId", {}).get("id", None)
     device_id   = get_permitted_device_id(jwt_token, request.device_name, authority, customer_id)
 
-
     start_ts = datetime.datetime.strptime(request.start_date, "%Y-%m-%d")
     end_ts   = datetime.datetime.strptime(request.end_date,   "%Y-%m-%d")
 
- 
     attrs         = fetch_all_attributes(jwt_token, device_id)
     normalized    = [VIBE_KEY_MAP.get(k, k) for k in request.data_types]
     telemetry     = fetch_telemetry(jwt_token, device_id, normalized, start_ts, end_ts)
 
-    
     df = pd.concat([
         pd.DataFrame(entries)
           .assign(ts=lambda d: pd.to_datetime(d["ts"], unit="ms"))
@@ -119,15 +117,12 @@ def generate_report(request: ReportRequest, authorization: str = Header(...)):
         for key, entries in telemetry.items()
     ], axis=1)
 
-  
     df = df.rename(columns={v: k for k, v in VIBE_KEY_MAP.items()})
-
 
     for friendly in request.data_types:
         if friendly not in df.columns:
             df[friendly] = pd.NA
 
-    
     timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
     filename  = f"{request.device_name}_report_{timestamp}.xlsx"
     filepath  = os.path.join(os.getcwd(), filename)
