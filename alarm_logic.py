@@ -106,6 +106,7 @@ def get_floor_boundaries(device_id: str) -> Optional[str]:
         try:
             for attr in res.json():
                 if attr["key"] == "ss_floor_boundaries":
+                    logger.info(f"[DEBUG] Floor boundaries value: {attr['value']}")
                     return attr["value"]
         except Exception as e:
             logger.error(f"[ATTRIBUTES] Failed to parse attributes: {e}")
@@ -165,40 +166,58 @@ def check_bucket_and_trigger(device: str, key: str, value: float, height: float,
     if not matched:
         buckets.append({"center": height, "count": 1})
 
-def floor_mismatch_detected(height: float, current_floor_index: int, floor_boundaries_str: str) -> bool:
-    try:
-        if height is None or current_floor_index is None:
-            return False
-        floor_boundaries = [float(x.strip()) for x in floor_boundaries_str.split(",") if x.strip()]
-        if not floor_boundaries or len(floor_boundaries) < 2:
-            return False
-        detected_floor = -1
-        for i in range(len(floor_boundaries) - 1):
-            if floor_boundaries[i] <= height < floor_boundaries[i + 1]:
-                detected_floor = i
-                break
-        return detected_floor != -1 and detected_floor != current_floor_index
-    except Exception as e:
-        logger.error(f"[ERROR] Floor mismatch logic: {e}")
-        return False
-
 def schedule_door_alarm(device_name: str, floor: str, ts: int):
+    """Schedules a door open too long alarm."""
     def fire_alarm():
         create_alarm_on_tb(device_name, "Door Open Too Long", ts + 15000, "MAJOR", {
             "duration_sec": 15,
             "floor": floor
         })
         logger.info(f"[DOOR] Door open too long alarm fired for {device_name}")
+    
     if device_name in door_open_timers:
         door_open_timers[device_name].cancel()
+    
     timer = threading.Timer(15, fire_alarm)
     door_open_timers[device_name] = timer
     timer.start()
 
 def cancel_door_alarm(device_name: str):
+    """Cancels any scheduled door alarm for a device."""
     if device_name in door_open_timers:
         door_open_timers[device_name].cancel()
         del door_open_timers[device_name]
+
+def floor_mismatch_detected(height: float, current_floor_index: int, floor_boundaries_str: str) -> bool:
+    try:
+        if height is None or current_floor_index is None:
+            logger.info("[DEBUG] Height or current_floor_index is None, skipping mismatch check.")
+            return False
+        
+        logger.info(f"[DEBUG] Raw boundaries string: {floor_boundaries_str}")
+        floor_boundaries = [float(x.strip()) for x in floor_boundaries_str.split(",") if x.strip()]
+        logger.info(f"[DEBUG] Parsed floor boundaries list: {floor_boundaries}")
+
+        if not floor_boundaries or len(floor_boundaries) < 2:
+            logger.warning("[DEBUG] Not enough floor boundaries for detection.")
+            return False
+        
+        detected_floor = -1
+        for i in range(len(floor_boundaries) - 1):
+            if floor_boundaries[i] <= height < floor_boundaries[i + 1]:
+                detected_floor = i
+                break
+        
+        logger.info(f"[DEBUG] Detected floor index: {detected_floor}, "
+                    f"Reported current_floor_index: {current_floor_index}")
+
+        mismatch = detected_floor != -1 and detected_floor != current_floor_index
+        logger.info(f"[DEBUG] Mismatch result: {mismatch}")
+        return mismatch
+
+    except Exception as e:
+        logger.error(f"[ERROR] Floor mismatch logic failed: {e}")
+        return False
 
 @router.post("/check_alarm/")
 async def check_alarm(payload: TelemetryPayload, authorization: Optional[str] = Header(None)):
@@ -209,6 +228,7 @@ async def check_alarm(payload: TelemetryPayload, authorization: Optional[str] = 
     triggered = []
 
     try:
+        # Humidity & Temperature
         for k in ["humidity", "temperature"]:
             val = getattr(payload, k)
             if val is not None and val > THRESHOLDS[k]:
@@ -224,16 +244,21 @@ async def check_alarm(payload: TelemetryPayload, authorization: Optional[str] = 
                     "floor": payload.floor
                 })
 
+        # Jerks and Vibrations
         for key in ["x_jerk", "y_jerk", "z_jerk", "x_vibe", "y_vibe", "z_vibe"]:
             val = getattr(payload, key)
             if val is not None and val > THRESHOLDS[key]:
                 check_bucket_and_trigger(payload.deviceName, key, val, payload.height, ts, payload.floor)
 
+        # Floor Mismatch
         if payload.current_floor_index is not None:
             device_id = get_device_id(payload.deviceName)
             if device_id:
                 floor_boundaries = get_floor_boundaries(device_id)
                 if floor_boundaries:
+                    logger.info(f"[DEBUG] Checking mismatch with Height={payload.height}, "
+                                f"Index={payload.current_floor_index}, "
+                                f"Boundaries={floor_boundaries}")
                     if floor_mismatch_detected(payload.height, int(payload.current_floor_index), floor_boundaries):
                         triggered.append({
                             "type": "Floor Mismatch Alarm",
@@ -246,6 +271,7 @@ async def check_alarm(payload: TelemetryPayload, authorization: Optional[str] = 
                             "boundaries": floor_boundaries
                         })
 
+        # Door alarms
         if payload.door_open is not None:
             device_door_state[payload.deviceName] = bool(payload.door_open)
 
