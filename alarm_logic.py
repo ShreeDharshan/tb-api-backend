@@ -53,13 +53,16 @@ def get_device_id(device_name: str, jwt_token: str) -> Optional[str]:
         return device_cache[device_name]
     url = f"{THINGSBOARD_HOST}/api/tenant/devices?deviceName={device_name}"
     res = requests.get(url, headers={"X-Authorization": f"Bearer {jwt_token}"})
+    logger.info(f"[DEVICE_LOOKUP] Fetching ID for {device_name} | Status: {res.status_code}")
     if res.status_code == 200:
         try:
             device_id = res.json()["id"]["id"]
             device_cache[device_name] = device_id
             return device_id
-        except Exception:
+        except Exception as e:
+            logger.error(f"[DEVICE_LOOKUP] Failed to parse device ID: {e}")
             return None
+    logger.error(f"[DEVICE_LOOKUP] Failed: {res.status_code} | {res.text}")
     return None
 
 def create_alarm_on_tb(device_name: str, alarm_type: str, ts: int, severity: str, details: dict, jwt_token: str):
@@ -149,13 +152,14 @@ def cancel_door_alarm(device_name: str):
         del door_open_timers[device_name]
 
 @router.post("/check_alarm/")
-async def check_alarm(payload: TelemetryPayload, authorization: str = Header(...)):
+async def check_alarm(payload: TelemetryPayload, authorization: Optional[str] = Header(None)):
     logger.info("--- /check_alarm/ invoked ---")
     logger.info(f"Authorization: {authorization}")
     logger.info(f"Payload received: {payload}")
 
-    if not authorization.startswith("Bearer "):
-        raise HTTPException(status_code=400, detail="Missing Bearer token")
+    if not authorization or not authorization.startswith("Bearer "):
+        logger.warning("Authorization header missing or malformed.")
+        raise HTTPException(status_code=400, detail="Missing or malformed Bearer token")
     
     jwt_token = authorization.split(" ", 1)[1]
     ts = int(datetime.utcnow().timestamp() * 1000)
@@ -203,6 +207,7 @@ async def check_alarm(payload: TelemetryPayload, authorization: str = Header(...
         else:
             cancel_door_alarm(payload.deviceName)
 
+        logger.info(f"Triggered alarms: {triggered}")
         return {"status": "processed", "alarms_triggered": triggered}
 
     except Exception as e:
