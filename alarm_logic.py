@@ -33,7 +33,6 @@ class TelemetryPayload(BaseModel):
     timestamp: str
     height: float
     current_floor_index: Optional[int] = None
-    ss_floor_boundaries: Optional[str] = None
     x_vibe: Optional[float] = None
     y_vibe: Optional[float] = None
     z_vibe: Optional[float] = None
@@ -69,9 +68,9 @@ def get_admin_token():
         raise HTTPException(status_code=500, detail="Admin login failed")
     
     token = resp.json()["token"]
-    expires_in = resp.json().get("refreshTokenExp", 3600)  # Default 1 hour
+    expires_in = resp.json().get("refreshTokenExp", 3600)
     admin_token_cache["token"] = token
-    admin_token_cache["expiry"] = time.time() + (expires_in / 1000) - 60  # Refresh 1 min early
+    admin_token_cache["expiry"] = time.time() + (expires_in / 1000) - 60
     logger.info("[ADMIN LOGIN] Admin token retrieved successfully")
     return token
 
@@ -94,6 +93,22 @@ def get_device_id(device_name: str) -> Optional[str]:
             logger.error(f"[DEVICE_LOOKUP] Failed to parse device ID: {e}")
             return None
     logger.error(f"[DEVICE_LOOKUP] Failed: {res.status_code} | {res.text}")
+    return None
+
+def get_floor_boundaries(device_id: str) -> Optional[str]:
+    """Fetch ss_floor_boundaries from server-side attributes."""
+    token = get_admin_token()
+    url = f"{THINGSBOARD_HOST}/api/plugins/telemetry/DEVICE/{device_id}/values/attributes/SERVER_SCOPE"
+    res = requests.get(url, headers={"X-Authorization": f"Bearer {token}"})
+    logger.info(f"[ATTRIBUTES] Fetching floor boundaries | Status: {res.status_code}")
+    
+    if res.status_code == 200:
+        try:
+            for attr in res.json():
+                if attr["key"] == "ss_floor_boundaries":
+                    return attr["value"]
+        except Exception as e:
+            logger.error(f"[ATTRIBUTES] Failed to parse attributes: {e}")
     return None
 
 def create_alarm_on_tb(device_name: str, alarm_type: str, ts: int, severity: str, details: dict):
@@ -188,7 +203,6 @@ def cancel_door_alarm(device_name: str):
 @router.post("/check_alarm/")
 async def check_alarm(payload: TelemetryPayload, authorization: Optional[str] = Header(None)):
     logger.info("--- /check_alarm/ invoked ---")
-    logger.info(f"Authorization: {authorization}")
     logger.info(f"Payload received: {payload}")
 
     ts = int(datetime.utcnow().timestamp() * 1000)
@@ -215,18 +229,22 @@ async def check_alarm(payload: TelemetryPayload, authorization: Optional[str] = 
             if val is not None and val > THRESHOLDS[key]:
                 check_bucket_and_trigger(payload.deviceName, key, val, payload.height, ts, payload.floor)
 
-        if payload.ss_floor_boundaries and payload.current_floor_index is not None:
-            if floor_mismatch_detected(payload.height, payload.current_floor_index, payload.ss_floor_boundaries):
-                triggered.append({
-                    "type": "Floor Mismatch Alarm",
-                    "value": payload.height,
-                    "severity": "CRITICAL"
-                })
-                create_alarm_on_tb(payload.deviceName, "Floor Mismatch Alarm", ts, "CRITICAL", {
-                    "reported_index": payload.current_floor_index,
-                    "height": payload.height,
-                    "boundaries": payload.ss_floor_boundaries
-                })
+        if payload.current_floor_index is not None:
+            device_id = get_device_id(payload.deviceName)
+            if device_id:
+                floor_boundaries = get_floor_boundaries(device_id)
+                if floor_boundaries:
+                    if floor_mismatch_detected(payload.height, int(payload.current_floor_index), floor_boundaries):
+                        triggered.append({
+                            "type": "Floor Mismatch Alarm",
+                            "value": payload.height,
+                            "severity": "CRITICAL"
+                        })
+                        create_alarm_on_tb(payload.deviceName, "Floor Mismatch Alarm", ts, "CRITICAL", {
+                            "reported_index": payload.current_floor_index,
+                            "height": payload.height,
+                            "boundaries": floor_boundaries
+                        })
 
         if payload.door_open is not None:
             device_door_state[payload.deviceName] = bool(payload.door_open)
