@@ -27,6 +27,8 @@ THRESHOLDS = {
     "z_vibe": 15.0
 }
 
+TOLERANCE_MM = 10.0  # landing tolerance for door mismatch
+
 class TelemetryPayload(BaseModel):
     deviceName: str
     floor: str
@@ -96,7 +98,7 @@ def get_device_id(device_name: str) -> Optional[str]:
     return None
 
 def get_floor_boundaries(device_id: str) -> Optional[str]:
-    """Fetch ss_floor_boundaries from server-side attributes."""
+    """Fetch floor_boundaries from server-side attributes."""
     token = get_admin_token()
     url = f"{THINGSBOARD_HOST}/api/plugins/telemetry/DEVICE/{device_id}/values/attributes/SERVER_SCOPE"
     res = requests.get(url, headers={"X-Authorization": f"Bearer {token}"})
@@ -110,7 +112,6 @@ def get_floor_boundaries(device_id: str) -> Optional[str]:
                 if attr["key"] == "floor_boundaries":
                     logger.info(f"[ATTRIBUTES FOUND] floor_boundaries = {attr['value']}")
                     return attr["value"]
-
             logger.warning("[ATTRIBUTES] floor_boundaries not found in attributes")
         except Exception as e:
             logger.error(f"[ATTRIBUTES] Failed to parse attributes: {e}")
@@ -202,21 +203,18 @@ def floor_mismatch_detected(height: float, current_floor_index: int, floor_bound
         floor_boundaries = [float(x.strip()) for x in floor_boundaries_str.split(",") if x.strip()]
         logger.info(f"[DEBUG] Parsed floor boundaries list: {floor_boundaries}")
 
-        if not floor_boundaries or len(floor_boundaries) < 2:
-            logger.warning("[DEBUG] Not enough floor boundaries for detection.")
-            return False
-        
-        detected_floor = -1
-        for i in range(len(floor_boundaries) - 1):
-            if floor_boundaries[i] <= height < floor_boundaries[i + 1]:
-                detected_floor = i
-                break
-        
-        logger.info(f"[DEBUG] Detected floor index: {detected_floor}, "
-                    f"Reported current_floor_index: {current_floor_index}")
+        if current_floor_index >= len(floor_boundaries):
+            logger.warning("[DEBUG] current_floor_index exceeds boundaries length")
+            return True  # Invalid index is a mismatch
 
-        mismatch = detected_floor != -1 and detected_floor != current_floor_index
-        logger.info(f"[DEBUG] Mismatch result: {mismatch}")
+        # Landing tolerance check
+        floor_center = floor_boundaries[current_floor_index]
+        deviation = abs(height - floor_center)
+        mismatch = deviation > TOLERANCE_MM
+
+        logger.info(f"[DEBUG] Floor center: {floor_center}, Height: {height}, "
+                    f"Deviation: {deviation}, Tolerance: {TOLERANCE_MM}, "
+                    f"Mismatch: {mismatch}")
         return mismatch
 
     except Exception as e:
