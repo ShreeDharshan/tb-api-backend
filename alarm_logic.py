@@ -104,10 +104,13 @@ def get_floor_boundaries(device_id: str) -> Optional[str]:
     
     if res.status_code == 200:
         try:
+            logger.info(f"[ATTRIBUTES RAW] Response JSON: {res.text}")
             for attr in res.json():
+                logger.info(f"[ATTRIBUTES] Key={attr.get('key')} Value={attr.get('value')}")
                 if attr["key"] == "ss_floor_boundaries":
-                    logger.info(f"[DEBUG] Floor boundaries value: {attr['value']}")
+                    logger.info(f"[ATTRIBUTES FOUND] ss_floor_boundaries = {attr['value']}")
                     return attr["value"]
+            logger.warning("[ATTRIBUTES] ss_floor_boundaries not found in attributes")
         except Exception as e:
             logger.error(f"[ATTRIBUTES] Failed to parse attributes: {e}")
     return None
@@ -256,9 +259,7 @@ async def check_alarm(payload: TelemetryPayload, authorization: Optional[str] = 
             if device_id:
                 floor_boundaries = get_floor_boundaries(device_id)
                 if floor_boundaries:
-                    logger.info(f"[DEBUG] Checking mismatch with Height={payload.height}, "
-                                f"Index={payload.current_floor_index}, "
-                                f"Boundaries={floor_boundaries}")
+                    logger.info(f"[DEBUG] Attempting mismatch detection with boundaries: {floor_boundaries}")
                     if floor_mismatch_detected(payload.height, int(payload.current_floor_index), floor_boundaries):
                         triggered.append({
                             "type": "Floor Mismatch Alarm",
@@ -270,6 +271,8 @@ async def check_alarm(payload: TelemetryPayload, authorization: Optional[str] = 
                             "height": payload.height,
                             "boundaries": floor_boundaries
                         })
+                else:
+                    logger.warning("[DEBUG] floor_boundaries is None or empty, skipping mismatch detection")
 
         # Door alarms
         if payload.door_open is not None:
