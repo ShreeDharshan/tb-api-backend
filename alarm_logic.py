@@ -171,9 +171,17 @@ def check_bucket_and_trigger(device: str, key: str, value: float, height: float,
     if not matched:
         buckets.append({"center": height, "count": 1})
 
-def process_door_alarm(device_name: str, door_open: bool, floor: str, ts: int):
+def process_door_alarm(device_name: str, door_open: Optional[bool], floor: str, ts: int):
     """Check if door has been open too long and trigger alarm."""
     now = time.time()
+
+    # Use last known state if door_open is missing
+    if door_open is None:
+        door_open = device_door_state.get(device_name, False)
+    else:
+        device_door_state[device_name] = door_open
+
+    logger.info(f"[DOOR DEBUG] Device={device_name}, door_open={door_open}, open_since={door_open_since.get(device_name)}")
 
     if door_open:
         if device_name not in door_open_since:
@@ -202,7 +210,7 @@ def floor_mismatch_detected(height: float, current_floor_index: int, floor_bound
 
         if current_floor_index >= len(floor_boundaries):
             logger.warning("[DEBUG] current_floor_index exceeds boundaries length")
-            return True  # Invalid index is a mismatch
+            return True
 
         floor_center = floor_boundaries[current_floor_index]
         deviation = abs(height - floor_center)
@@ -266,8 +274,7 @@ async def check_alarm(payload: TelemetryPayload, authorization: Optional[str] = 
                 else:
                     logger.warning("[DEBUG] floor_boundaries is None or empty, skipping mismatch detection")
 
-        if payload.door_open is not None:
-            process_door_alarm(payload.deviceName, payload.door_open, payload.floor, ts)
+        process_door_alarm(payload.deviceName, payload.door_open, payload.floor, ts)
 
         logger.info(f"Triggered alarms: {triggered}")
         return {"status": "processed", "alarms_triggered": triggered}
