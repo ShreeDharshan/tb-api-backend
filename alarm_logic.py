@@ -107,10 +107,11 @@ def get_floor_boundaries(device_id: str) -> Optional[str]:
             logger.info(f"[ATTRIBUTES RAW] Response JSON: {res.text}")
             for attr in res.json():
                 logger.info(f"[ATTRIBUTES] Key={attr.get('key')} Value={attr.get('value')}")
-                if attr["key"] == "ss_floor_boundaries":
-                    logger.info(f"[ATTRIBUTES FOUND] ss_floor_boundaries = {attr['value']}")
+                if attr["key"] == "floor_boundaries":
+                    logger.info(f"[ATTRIBUTES FOUND] floor_boundaries = {attr['value']}")
                     return attr["value"]
-            logger.warning("[ATTRIBUTES] ss_floor_boundaries not found in attributes")
+
+            logger.warning("[ATTRIBUTES] floor_boundaries not found in attributes")
         except Exception as e:
             logger.error(f"[ATTRIBUTES] Failed to parse attributes: {e}")
     return None
