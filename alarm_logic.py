@@ -4,7 +4,6 @@ from typing import Optional
 from datetime import datetime
 import requests
 import os
-import threading
 import logging
 import time
 
@@ -28,6 +27,7 @@ THRESHOLDS = {
 }
 
 TOLERANCE_MM = 10.0  # landing tolerance for door mismatch
+DOOR_OPEN_THRESHOLD_SEC = 15  # seconds to trigger alarm
 
 class TelemetryPayload(BaseModel):
     deviceName: str
@@ -47,8 +47,8 @@ class TelemetryPayload(BaseModel):
 
 device_cache = {}
 bucket_counts = {}
-door_open_timers = {}
 device_door_state = {}
+door_open_since = {}
 
 # === Admin token caching ===
 admin_token_cache = {"token": None, "expiry": 0}
@@ -171,27 +171,24 @@ def check_bucket_and_trigger(device: str, key: str, value: float, height: float,
     if not matched:
         buckets.append({"center": height, "count": 1})
 
-def schedule_door_alarm(device_name: str, floor: str, ts: int):
-    """Schedules a door open too long alarm."""
-    def fire_alarm():
-        create_alarm_on_tb(device_name, "Door Open Too Long", ts + 15000, "MAJOR", {
-            "duration_sec": 15,
-            "floor": floor
-        })
-        logger.info(f"[DOOR] Door open too long alarm fired for {device_name}")
-    
-    if device_name in door_open_timers:
-        door_open_timers[device_name].cancel()
-    
-    timer = threading.Timer(15, fire_alarm)
-    door_open_timers[device_name] = timer
-    timer.start()
+def process_door_alarm(device_name: str, door_open: bool, floor: str, ts: int):
+    """Check if door has been open too long and trigger alarm."""
+    now = time.time()
 
-def cancel_door_alarm(device_name: str):
-    """Cancels any scheduled door alarm for a device."""
-    if device_name in door_open_timers:
-        door_open_timers[device_name].cancel()
-        del door_open_timers[device_name]
+    if door_open:
+        if device_name not in door_open_since:
+            door_open_since[device_name] = now
+        else:
+            duration = now - door_open_since[device_name]
+            if duration >= DOOR_OPEN_THRESHOLD_SEC:
+                create_alarm_on_tb(device_name, "Door Open Too Long", ts, "MAJOR", {
+                    "duration_sec": int(duration),
+                    "floor": floor
+                })
+                logger.info(f"[DOOR] Alarm fired for {device_name}, open {duration:.1f}s")
+                door_open_since.pop(device_name, None)
+    else:
+        door_open_since.pop(device_name, None)
 
 def floor_mismatch_detected(height: float, current_floor_index: int, floor_boundaries_str: str) -> bool:
     try:
@@ -207,7 +204,6 @@ def floor_mismatch_detected(height: float, current_floor_index: int, floor_bound
             logger.warning("[DEBUG] current_floor_index exceeds boundaries length")
             return True  # Invalid index is a mismatch
 
-        # Landing tolerance check
         floor_center = floor_boundaries[current_floor_index]
         deviation = abs(height - floor_center)
         mismatch = deviation > TOLERANCE_MM
@@ -230,7 +226,6 @@ async def check_alarm(payload: TelemetryPayload, authorization: Optional[str] = 
     triggered = []
 
     try:
-        # Humidity & Temperature
         for k in ["humidity", "temperature"]:
             val = getattr(payload, k)
             if val is not None and val > THRESHOLDS[k]:
@@ -246,13 +241,11 @@ async def check_alarm(payload: TelemetryPayload, authorization: Optional[str] = 
                     "floor": payload.floor
                 })
 
-        # Jerks and Vibrations
         for key in ["x_jerk", "y_jerk", "z_jerk", "x_vibe", "y_vibe", "z_vibe"]:
             val = getattr(payload, key)
             if val is not None and val > THRESHOLDS[key]:
                 check_bucket_and_trigger(payload.deviceName, key, val, payload.height, ts, payload.floor)
 
-        # Floor Mismatch
         if payload.current_floor_index is not None:
             device_id = get_device_id(payload.deviceName)
             if device_id:
@@ -273,14 +266,8 @@ async def check_alarm(payload: TelemetryPayload, authorization: Optional[str] = 
                 else:
                     logger.warning("[DEBUG] floor_boundaries is None or empty, skipping mismatch detection")
 
-        # Door alarms
         if payload.door_open is not None:
-            device_door_state[payload.deviceName] = bool(payload.door_open)
-
-        if device_door_state.get(payload.deviceName, False):
-            schedule_door_alarm(payload.deviceName, payload.floor, ts)
-        else:
-            cancel_door_alarm(payload.deviceName)
+            process_door_alarm(payload.deviceName, payload.door_open, payload.floor, ts)
 
         logger.info(f"Triggered alarms: {triggered}")
         return {"status": "processed", "alarms_triggered": triggered}
