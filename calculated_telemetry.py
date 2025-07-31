@@ -15,6 +15,7 @@ THINGSBOARD_BASE_URL = "https://thingsboard.cloud"
 def get_home_floor(device_token: str) -> int:
     """
     Fetch home_floor server-side attribute for a device using its access token.
+    Supports both 'home_floor' and 'ss_home_floor' naming.
     """
     url = f"{THINGSBOARD_BASE_URL}/api/v1/{device_token}/attributes"
     headers = {"Content-Type": "application/json"}
@@ -23,8 +24,14 @@ def get_home_floor(device_token: str) -> int:
         response.raise_for_status()
         attrs = response.json()
         server_attrs = attrs.get("server", {})
+
+        # Check both variants
         if "home_floor" in server_attrs:
             return int(server_attrs["home_floor"])
+        elif "ss_home_floor" in server_attrs:
+            return int(server_attrs["ss_home_floor"])
+        else:
+            print(f"No home_floor attribute found for token {device_token}. Server attrs: {server_attrs}")
     except Exception as e:
         print(f"Error fetching home_floor for token {device_token}: {e}")
     return None
@@ -60,7 +67,7 @@ async def calculated_telemetry(request: Request):
     if not device_token:
         return {"status": "error", "msg": "device_token required"}
 
-    # Fetch home_floor using device token (same as alarm_logic)
+    # Fetch home_floor using device token (handles both attribute names)
     home_floor = get_home_floor(device_token)
     if home_floor is None:
         return {"status": "error", "msg": "home_floor attribute not found"}
@@ -76,17 +83,14 @@ async def calculated_telemetry(request: Request):
     current_time = ts // 1000  # convert to seconds
 
     # --- Idle logic ---
-    if lift_status.lower() == "idle" and current_floor_index != home_floor:
+    if lift_status and lift_status.lower() == "idle" and int(current_floor_index) != home_floor:
         if state["last_idle_ts"] is None:
-            # Start idle streak
             state["last_idle_ts"] = current_time
         else:
-            # Accumulate idle duration
             elapsed = current_time - state["last_idle_ts"]
             state["total_idle_outside"] += elapsed
             state["last_idle_ts"] = current_time
     else:
-        # Reset streak timer when moving or at home floor
         state["last_idle_ts"] = None
 
     # --- Build calculated telemetry ---
