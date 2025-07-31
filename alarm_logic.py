@@ -1,6 +1,6 @@
 from fastapi import APIRouter, Header, HTTPException
 from pydantic import BaseModel
-from typing import Optional
+from typing import Optional, Tuple
 from datetime import datetime
 import requests
 import os
@@ -190,22 +190,22 @@ def process_door_alarm(device_name: str, door_open: Optional[bool], floor: str, 
     else:
         door_open_since.pop(device_name, None)
 
-def floor_mismatch_detected(height: float, current_floor_index: int, floor_boundaries_str: str) -> bool:
+def floor_mismatch_detected(height: float, current_floor_index: int, floor_boundaries_str: str) -> Tuple[bool, float, float]:
     try:
         if height is None or current_floor_index is None:
-            return False
+            return False, 0, 0
         
         floor_boundaries = [float(x.strip()) for x in floor_boundaries_str.split(",") if x.strip()]
         if current_floor_index >= len(floor_boundaries):
-            return True
+            return True, 0, 0
 
         floor_center = floor_boundaries[current_floor_index]
-        deviation = abs(height - floor_center)
-        return deviation > TOLERANCE_MM
+        deviation = height - floor_center
+        return abs(deviation) > TOLERANCE_MM, deviation, floor_center
 
     except Exception as e:
         logger.error(f"[ERROR] Floor mismatch logic failed: {e}")
-        return False
+        return False, 0, 0
 
 @router.post("/check_alarm/")
 async def check_alarm(payload: TelemetryPayload, authorization: Optional[str] = Header(None)):
@@ -243,16 +243,21 @@ async def check_alarm(payload: TelemetryPayload, authorization: Optional[str] = 
             if device_id:
                 floor_boundaries = get_floor_boundaries(device_id)
                 if floor_boundaries:
-                    if floor_mismatch_detected(payload.height, int(payload.current_floor_index), floor_boundaries):
+                    mismatch, deviation, floor_center = floor_mismatch_detected(payload.height, int(payload.current_floor_index), floor_boundaries)
+                    if mismatch:
+                        position = "above" if deviation > 0 else "below"
                         triggered.append({
                             "type": "Floor Mismatch Alarm",
                             "value": payload.height,
-                            "severity": "CRITICAL"
+                            "severity": "CRITICAL",
+                            "position": position
                         })
                         create_alarm_on_tb(payload.deviceName, "Floor Mismatch Alarm", ts, "CRITICAL", {
                             "reported_index": payload.current_floor_index,
                             "height": payload.height,
-                            "boundaries": floor_boundaries
+                            "boundaries": floor_boundaries,
+                            "deviation_mm": abs(deviation),
+                            "position": position
                         })
 
         process_door_alarm(payload.deviceName, payload.door_open, payload.floor, ts)
