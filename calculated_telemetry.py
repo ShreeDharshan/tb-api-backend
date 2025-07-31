@@ -1,89 +1,130 @@
-import time
+from fastapi import APIRouter, HTTPException
+from pydantic import BaseModel
+from typing import Optional, Dict
 import requests
-from fastapi import APIRouter, Request
-from typing import Dict, Any
+import os
+import logging
+import time
+
+# === Logging config ===
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 router = APIRouter()
 
-# Store temporary state in memory (per device token)
-device_state = {}
+THINGSBOARD_HOST = "https://thingsboard.cloud"
 
-# ThingsBoard Cloud base URL
-THINGSBOARD_BASE_URL = "https://thingsboard.cloud"
+# Cache admin token
+admin_token_cache = {"token": None, "expiry": 0}
 
+# In-memory state for idle calculation
+device_state: Dict[str, Dict[str, Optional[int]]] = {}
 
-def get_home_floor(device_token: str) -> int:
-    """
-    Fetch home_floor server-side attribute for a device using its access token.
-    Supports both 'home_floor' and 'ss_home_floor' naming.
-    """
-    url = f"{THINGSBOARD_BASE_URL}/api/v1/{device_token}/attributes"
-    headers = {"Content-Type": "application/json"}
-    try:
-        response = requests.get(url, headers=headers, timeout=5)
-        response.raise_for_status()
-        attrs = response.json()
-        server_attrs = attrs.get("server", {})
+class CalculatedTelemetryPayload(BaseModel):
+    deviceName: str
+    device_token: str
+    current_floor_index: int
+    lift_status: Optional[str] = None
+    ts: Optional[int] = None
 
-        # Check both variants
-        if "home_floor" in server_attrs:
-            return int(server_attrs["home_floor"])
-        elif "ss_home_floor" in server_attrs:
-            return int(server_attrs["ss_home_floor"])
-        else:
-            print(f"No home_floor attribute found for token {device_token}. Server attrs: {server_attrs}")
-    except Exception as e:
-        print(f"Error fetching home_floor for token {device_token}: {e}")
+# --- Helpers (mirroring alarm_logic) ---
+
+def get_admin_token():
+    if admin_token_cache["token"] and admin_token_cache["expiry"] > time.time():
+        return admin_token_cache["token"]
+    
+    url = f"{THINGSBOARD_HOST}/api/auth/login"
+    credentials = {
+        "username": os.getenv("TB_ADMIN_USER"),
+        "password": os.getenv("TB_ADMIN_PASS")
+    }
+    logger.info("[ADMIN LOGIN] Logging in to ThingsBoard Cloud for calculated telemetry...")
+    resp = requests.post(url, json=credentials)
+    if resp.status_code != 200:
+        logger.error(f"[ADMIN LOGIN] Failed: {resp.status_code} - {resp.text}")
+        raise HTTPException(status_code=500, detail="Admin login failed")
+    
+    token = resp.json()["token"]
+    expires_in = resp.json().get("refreshTokenExp", 3600)
+    admin_token_cache["token"] = token
+    admin_token_cache["expiry"] = time.time() + (expires_in / 1000) - 60
+    logger.info("[ADMIN LOGIN] Admin token retrieved successfully")
+    return token
+
+def get_device_id(device_name: str) -> Optional[str]:
+    url = f"{THINGSBOARD_HOST}/api/tenant/devices?deviceName={device_name}"
+    token = get_admin_token()
+    res = requests.get(url, headers={"X-Authorization": f"Bearer {token}"})
+    logger.info(f"[DEVICE_LOOKUP] Fetching ID for {device_name} | Status: {res.status_code}")
+    
+    if res.status_code == 200:
+        try:
+            device_id = res.json()["id"]["id"]
+            return device_id
+        except Exception as e:
+            logger.error(f"[DEVICE_LOOKUP] Failed to parse device ID: {e}")
+            return None
+    logger.error(f"[DEVICE_LOOKUP] Failed: {res.status_code} | {res.text}")
     return None
 
+def get_home_floor(device_id: str) -> Optional[int]:
+    url = f"{THINGSBOARD_HOST}/api/plugins/telemetry/DEVICE/{device_id}/values/attributes/SERVER_SCOPE"
+    token = get_admin_token()
+    res = requests.get(url, headers={"X-Authorization": f"Bearer {token}"})
+    logger.info(f"[ATTRIBUTES] Fetching home_floor | Status: {res.status_code}")
+    
+    if res.status_code == 200:
+        try:
+            for attr in res.json():
+                if attr.get("key") == "home_floor":
+                    return int(attr.get("value"))
+                if attr.get("key") == "ss_home_floor":
+                    return int(attr.get("value"))
+            logger.warning("[ATTRIBUTES] home_floor not found")
+        except Exception as e:
+            logger.error(f"[ATTRIBUTES] Failed to parse attributes: {e}")
+    return None
 
-def push_telemetry_to_tb(device_token: str, telemetry: Dict[str, Any]) -> None:
-    """
-    Push calculated telemetry back to ThingsBoard Cloud using device token.
-    """
-    url = f"{THINGSBOARD_BASE_URL}/api/v1/{device_token}/telemetry"
-    headers = {"Content-Type": "application/json"}
+def push_telemetry_to_tb(device_token: str, telemetry: Dict[str, int]) -> None:
+    url = f"{THINGSBOARD_HOST}/api/v1/{device_token}/telemetry"
     try:
-        response = requests.post(url, headers=headers, json=telemetry, timeout=5)
-        response.raise_for_status()
+        response = requests.post(url, json=telemetry, headers={"Content-Type": "application/json"}, timeout=5)
+        if response.status_code != 200:
+            logger.error(f"Failed to push telemetry: {response.status_code} - {response.text}")
     except Exception as e:
-        print(f"Error pushing calculated telemetry for token {device_token}: {e}")
+        logger.error(f"Error pushing calculated telemetry: {e}")
 
+# --- API Endpoint ---
 
 @router.post("/calculated-telemetry/")
-async def calculated_telemetry(request: Request):
-    """
-    Calculate derived telemetry values such as idle time outside home floor
-    and push them back to ThingsBoard Cloud as new telemetry keys.
-    """
-    data = await request.json()
+async def calculated_telemetry(payload: CalculatedTelemetryPayload):
+    logger.info("--- /calculated-telemetry/ invoked ---")
+    logger.info(f"Payload received: {payload}")
 
-    # Expected payload from rule chain
-    device_token = data.get("device_token")
-    current_floor_index = data.get("current_floor_index")
-    lift_status = data.get("lift_status")
-    ts = data.get("ts", int(time.time() * 1000))
+    ts = payload.ts or int(time.time() * 1000)
 
-    if not device_token:
-        return {"status": "error", "msg": "device_token required"}
+    # Get device ID
+    device_id = get_device_id(payload.deviceName)
+    if not device_id:
+        return {"status": "error", "msg": f"Could not find device ID for {payload.deviceName}"}
 
-    # Fetch home_floor using device token (handles both attribute names)
-    home_floor = get_home_floor(device_token)
+    # Get home_floor attribute
+    home_floor = get_home_floor(device_id)
     if home_floor is None:
         return {"status": "error", "msg": "home_floor attribute not found"}
 
-    # Initialize state for this device if needed
-    if device_token not in device_state:
-        device_state[device_token] = {
+    # Initialize state if not present
+    if payload.device_token not in device_state:
+        device_state[payload.device_token] = {
             "last_idle_ts": None,
             "total_idle_outside": 0
         }
 
-    state = device_state[device_token]
-    current_time = ts // 1000  # convert to seconds
+    state = device_state[payload.device_token]
+    current_time = ts // 1000
 
-    # --- Idle logic ---
-    if lift_status and lift_status.lower() == "idle" and int(current_floor_index) != home_floor:
+    # --- Idle calculation ---
+    if payload.lift_status and payload.lift_status.lower() == "idle" and int(payload.current_floor_index) != home_floor:
         if state["last_idle_ts"] is None:
             state["last_idle_ts"] = current_time
         else:
@@ -93,16 +134,14 @@ async def calculated_telemetry(request: Request):
     else:
         state["last_idle_ts"] = None
 
-    # --- Build calculated telemetry ---
     calculated_values = {
         "idle_outside_home_streak": (
-            current_time - state["last_idle_ts"]
-            if state["last_idle_ts"] else 0
+            current_time - state["last_idle_ts"] if state["last_idle_ts"] else 0
         ),
         "total_idle_outside_home_seconds": state["total_idle_outside"]
     }
 
-    # --- Push back to ThingsBoard Cloud ---
-    push_telemetry_to_tb(device_token, calculated_values)
+    # Push telemetry back to TB
+    push_telemetry_to_tb(payload.device_token, calculated_values)
 
     return {"status": "success", "calculated": calculated_values}
