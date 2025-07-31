@@ -26,8 +26,8 @@ THRESHOLDS = {
     "z_vibe": 15.0
 }
 
-TOLERANCE_MM = 10.0  # landing tolerance for door mismatch
-DOOR_OPEN_THRESHOLD_SEC = 15  # seconds to trigger alarm
+TOLERANCE_MM = 10.0
+DOOR_OPEN_THRESHOLD_SEC = 15
 
 class TelemetryPayload(BaseModel):
     deviceName: str
@@ -50,11 +50,9 @@ bucket_counts = {}
 device_door_state = {}
 door_open_since = {}
 
-# === Admin token caching ===
 admin_token_cache = {"token": None, "expiry": 0}
 
 def get_admin_token():
-    """Login as Tenant Admin and return a cached token."""
     if admin_token_cache["token"] and admin_token_cache["expiry"] > time.time():
         return admin_token_cache["token"]
     
@@ -77,7 +75,6 @@ def get_admin_token():
     return token
 
 def get_device_id(device_name: str) -> Optional[str]:
-    """Fetch device ID using admin token."""
     if device_name in device_cache:
         return device_cache[device_name]
     
@@ -98,7 +95,6 @@ def get_device_id(device_name: str) -> Optional[str]:
     return None
 
 def get_floor_boundaries(device_id: str) -> Optional[str]:
-    """Fetch floor_boundaries from server-side attributes."""
     token = get_admin_token()
     url = f"{THINGSBOARD_HOST}/api/plugins/telemetry/DEVICE/{device_id}/values/attributes/SERVER_SCOPE"
     res = requests.get(url, headers={"X-Authorization": f"Bearer {token}"})
@@ -118,7 +114,6 @@ def get_floor_boundaries(device_id: str) -> Optional[str]:
     return None
 
 def create_alarm_on_tb(device_name: str, alarm_type: str, ts: int, severity: str, details: dict):
-    """Create an alarm using admin token."""
     device_id = get_device_id(device_name)
     if not device_id:
         logger.warning(f"[ALARM] Could not fetch device ID for {device_name}")
@@ -172,10 +167,7 @@ def check_bucket_and_trigger(device: str, key: str, value: float, height: float,
         buckets.append({"center": height, "count": 1})
 
 def process_door_alarm(device_name: str, door_open: Optional[bool], floor: str, ts: int):
-    """Check if door has been open too long and trigger alarm."""
     now = time.time()
-
-    # Use last known state if door_open is missing
     if door_open is None:
         door_open = device_door_state.get(device_name, False)
     else:
@@ -201,25 +193,15 @@ def process_door_alarm(device_name: str, door_open: Optional[bool], floor: str, 
 def floor_mismatch_detected(height: float, current_floor_index: int, floor_boundaries_str: str) -> bool:
     try:
         if height is None or current_floor_index is None:
-            logger.info("[DEBUG] Height or current_floor_index is None, skipping mismatch check.")
             return False
         
-        logger.info(f"[DEBUG] Raw boundaries string: {floor_boundaries_str}")
         floor_boundaries = [float(x.strip()) for x in floor_boundaries_str.split(",") if x.strip()]
-        logger.info(f"[DEBUG] Parsed floor boundaries list: {floor_boundaries}")
-
         if current_floor_index >= len(floor_boundaries):
-            logger.warning("[DEBUG] current_floor_index exceeds boundaries length")
             return True
 
         floor_center = floor_boundaries[current_floor_index]
         deviation = abs(height - floor_center)
-        mismatch = deviation > TOLERANCE_MM
-
-        logger.info(f"[DEBUG] Floor center: {floor_center}, Height: {height}, "
-                    f"Deviation: {deviation}, Tolerance: {TOLERANCE_MM}, "
-                    f"Mismatch: {mismatch}")
-        return mismatch
+        return deviation > TOLERANCE_MM
 
     except Exception as e:
         logger.error(f"[ERROR] Floor mismatch logic failed: {e}")
@@ -254,12 +236,13 @@ async def check_alarm(payload: TelemetryPayload, authorization: Optional[str] = 
             if val is not None and val > THRESHOLDS[key]:
                 check_bucket_and_trigger(payload.deviceName, key, val, payload.height, ts, payload.floor)
 
-        if payload.current_floor_index is not None:
+        # Floor mismatch triggers only when door is open
+        is_door_open = payload.door_open or device_door_state.get(payload.deviceName, False)
+        if payload.current_floor_index is not None and is_door_open:
             device_id = get_device_id(payload.deviceName)
             if device_id:
                 floor_boundaries = get_floor_boundaries(device_id)
                 if floor_boundaries:
-                    logger.info(f"[DEBUG] Attempting mismatch detection with boundaries: {floor_boundaries}")
                     if floor_mismatch_detected(payload.height, int(payload.current_floor_index), floor_boundaries):
                         triggered.append({
                             "type": "Floor Mismatch Alarm",
@@ -271,8 +254,6 @@ async def check_alarm(payload: TelemetryPayload, authorization: Optional[str] = 
                             "height": payload.height,
                             "boundaries": floor_boundaries
                         })
-                else:
-                    logger.warning("[DEBUG] floor_boundaries is None or empty, skipping mismatch detection")
 
         process_door_alarm(payload.deviceName, payload.door_open, payload.floor, ts)
 
