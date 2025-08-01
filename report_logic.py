@@ -7,7 +7,7 @@ import os
 from openpyxl.worksheet.table import Table, TableStyleInfo
 from openpyxl.utils import get_column_letter
 
-# ✅ Cloud deployment uses ThingsBoard Cloud
+
 TB_HOST = "https://thingsboard.cloud"
 
 router = APIRouter()
@@ -90,7 +90,7 @@ def fetch_all_attributes(jwt_token: str, device_id: str) -> dict:
         for entry in resp.json():
             combined[entry["key"]] = entry["value"]
     return combined
-
+    
 @router.post("/generate_report/")
 def generate_report(request: ReportRequest, authorization: str = Header(...)):
     if not authorization.startswith("Bearer "):
