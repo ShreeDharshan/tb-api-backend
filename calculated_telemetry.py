@@ -87,12 +87,33 @@ def get_home_floor(device_id: str) -> Optional[int]:
 
 def push_telemetry_to_tb(device_token: str, telemetry: Dict[str, int]) -> None:
     url = f"{THINGSBOARD_HOST}/api/v1/{device_token}/telemetry"
+
+    # 🚨 Log everything pushed
+    logger.warning(f"[TELEMETRY PUSH] Raw telemetry to push: {telemetry}")
+
+    # ✅ Only allow calculated fields
+    safe_telemetry = {
+        k: v for k, v in telemetry.items()
+        if k in ["idle_outside_home_streak", "total_idle_outside_home_seconds"]
+    }
+
+    if not safe_telemetry:
+        logger.error("[TELEMETRY PUSH] Aborting - no valid calculated fields")
+        return
+
     try:
-        response = requests.post(url, json=telemetry, headers={"Content-Type": "application/json"}, timeout=5)
+        response = requests.post(
+            url,
+            json=safe_telemetry,
+            headers={"Content-Type": "application/json"},
+            timeout=5
+        )
         if response.status_code != 200:
-            logger.error(f"Failed to push telemetry: {response.status_code} - {response.text}")
+            logger.error(f"[TELEMETRY PUSH] Failed: {response.status_code} - {response.text}")
+        else:
+            logger.info("[TELEMETRY PUSH] Successfully pushed calculated telemetry")
     except Exception as e:
-        logger.error(f"Error pushing calculated telemetry: {e}")
+        logger.error(f"[TELEMETRY PUSH] Exception: {e}")
 
 # --- API Endpoint ---
 
@@ -141,7 +162,7 @@ async def calculated_telemetry(payload: CalculatedTelemetryPayload):
         "total_idle_outside_home_seconds": state["total_idle_outside"]
     }
 
-    # Push telemetry back to TB
+    # Push telemetry back to TB (safe filtered)
     push_telemetry_to_tb(payload.device_token, calculated_values)
 
     return {"status": "success", "calculated": calculated_values}
