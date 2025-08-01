@@ -50,8 +50,11 @@ async def calculate_telemetry(payload: TelemetryPayload):
     state = device_state[device]
     home_floor = 1  # This can be dynamically fetched if needed
 
+    # Treat lift as idle if status is "Idle" OR door is open
+    is_idle = (payload.lift_status.lower() == "idle") or payload.door_open
+
     # ----- Idle calculation -----
-    if payload.lift_status.lower() == "idle":
+    if is_idle:
         if floor == home_floor:
             if state["last_idle_home_ts"] is None:
                 state["last_idle_home_ts"] = current_time
