@@ -6,14 +6,22 @@ import requests
 import os
 import logging
 import time
-
+import json
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 router = APIRouter()
 
-THINGSBOARD_HOST = "https://thingsboard.cloud"
+# === Load Multi-Account Configuration ===
+try:
+    ACCOUNTS = json.loads(os.getenv("TB_ACCOUNTS", '{}'))
+    if not isinstance(ACCOUNTS, dict):
+        raise ValueError("TB_ACCOUNTS must be a JSON object")
+except json.JSONDecodeError:
+    raise RuntimeError("Invalid JSON format for TB_ACCOUNTS environment variable")
+
+logger.info(f"[INIT] Loaded ThingsBoard accounts: {list(ACCOUNTS.keys())}")
 
 THRESHOLDS = {
     "humidity": 50.0,
@@ -50,43 +58,52 @@ bucket_counts = {}
 device_door_state = {}
 door_open_since = {}
 
-admin_token_cache = {"token": None, "expiry": 0}
+# Token cache per account
+admin_token_cache = {acc: {"token": None, "expiry": 0} for acc in ACCOUNTS}
 
-def get_admin_token():
-    if admin_token_cache["token"] and admin_token_cache["expiry"] > time.time():
-        return admin_token_cache["token"]
+def get_admin_token(account_id: str) -> str:
+    """Fetch or reuse admin token for a specific ThingsBoard account."""
+    if account_id not in ACCOUNTS:
+        raise HTTPException(status_code=400, detail="Invalid account ID")
+
+    cache = admin_token_cache[account_id]
+    if cache["token"] and cache["expiry"] > time.time():
+        return cache["token"]
     
-    url = f"{THINGSBOARD_HOST}/api/auth/login"
+    host = ACCOUNTS[account_id]
+    url = f"{host}/api/auth/login"
     credentials = {
-        "username": os.getenv("TB_ADMIN_USER"),
-        "password": os.getenv("TB_ADMIN_PASS")
+        "username": os.getenv(f"{account_id.upper()}_ADMIN_USER"),
+        "password": os.getenv(f"{account_id.upper()}_ADMIN_PASS")
     }
-    logger.info("[ADMIN LOGIN] Logging in to ThingsBoard Cloud...")
+    logger.info(f"[ADMIN LOGIN] Logging in to ThingsBoard ({account_id})...")
     resp = requests.post(url, json=credentials)
     if resp.status_code != 200:
-        logger.error(f"[ADMIN LOGIN] Failed: {resp.status_code} - {resp.text}")
+        logger.error(f"[ADMIN LOGIN] Failed for {account_id}: {resp.status_code} - {resp.text}")
         raise HTTPException(status_code=500, detail="Admin login failed")
     
     token = resp.json()["token"]
     expires_in = resp.json().get("refreshTokenExp", 3600)
-    admin_token_cache["token"] = token
-    admin_token_cache["expiry"] = time.time() + (expires_in / 1000) - 60
-    logger.info("[ADMIN LOGIN] Admin token retrieved successfully")
+    cache["token"] = token
+    cache["expiry"] = time.time() + (expires_in / 1000) - 60
+    logger.info(f"[ADMIN LOGIN] Admin token retrieved successfully for {account_id}")
     return token
 
-def get_device_id(device_name: str) -> Optional[str]:
-    if device_name in device_cache:
-        return device_cache[device_name]
+def get_device_id(device_name: str, account_id: str) -> Optional[str]:
+    cache_key = f"{account_id}:{device_name}"
+    if cache_key in device_cache:
+        return device_cache[cache_key]
     
-    token = get_admin_token()
-    url = f"{THINGSBOARD_HOST}/api/tenant/devices?deviceName={device_name}"
+    token = get_admin_token(account_id)
+    host = ACCOUNTS[account_id]
+    url = f"{host}/api/tenant/devices?deviceName={device_name}"
     res = requests.get(url, headers={"X-Authorization": f"Bearer {token}"})
-    logger.info(f"[DEVICE_LOOKUP] Fetching ID for {device_name} | Status: {res.status_code}")
+    logger.info(f"[DEVICE_LOOKUP] Fetching ID for {device_name} ({account_id}) | Status: {res.status_code}")
     
     if res.status_code == 200:
         try:
             device_id = res.json()["id"]["id"]
-            device_cache[device_name] = device_id
+            device_cache[cache_key] = device_id
             return device_id
         except Exception as e:
             logger.error(f"[DEVICE_LOOKUP] Failed to parse device ID: {e}")
@@ -94,32 +111,30 @@ def get_device_id(device_name: str) -> Optional[str]:
     logger.error(f"[DEVICE_LOOKUP] Failed: {res.status_code} | {res.text}")
     return None
 
-def get_floor_boundaries(device_id: str) -> Optional[str]:
-    token = get_admin_token()
-    url = f"{THINGSBOARD_HOST}/api/plugins/telemetry/DEVICE/{device_id}/values/attributes/SERVER_SCOPE"
+def get_floor_boundaries(device_id: str, account_id: str) -> Optional[str]:
+    token = get_admin_token(account_id)
+    host = ACCOUNTS[account_id]
+    url = f"{host}/api/plugins/telemetry/DEVICE/{device_id}/values/attributes/SERVER_SCOPE"
     res = requests.get(url, headers={"X-Authorization": f"Bearer {token}"})
-    logger.info(f"[ATTRIBUTES] Fetching floor boundaries | Status: {res.status_code}")
+    logger.info(f"[ATTRIBUTES] Fetching floor boundaries ({account_id}) | Status: {res.status_code}")
     
     if res.status_code == 200:
         try:
-            logger.info(f"[ATTRIBUTES RAW] Response JSON: {res.text}")
             for attr in res.json():
-                logger.info(f"[ATTRIBUTES] Key={attr.get('key')} Value={attr.get('value')}")
                 if attr["key"] == "floor_boundaries":
-                    logger.info(f"[ATTRIBUTES FOUND] floor_boundaries = {attr['value']}")
                     return attr["value"]
-            logger.warning("[ATTRIBUTES] floor_boundaries not found in attributes")
         except Exception as e:
             logger.error(f"[ATTRIBUTES] Failed to parse attributes: {e}")
     return None
 
-def create_alarm_on_tb(device_name: str, alarm_type: str, ts: int, severity: str, details: dict):
-    device_id = get_device_id(device_name)
+def create_alarm_on_tb(device_name: str, alarm_type: str, ts: int, severity: str, details: dict, account_id: str):
+    device_id = get_device_id(device_name, account_id)
     if not device_id:
         logger.warning(f"[ALARM] Could not fetch device ID for {device_name}")
         return
     
-    token = get_admin_token()
+    token = get_admin_token(account_id)
+    host = ACCOUNTS[account_id]
     alarm_payload = {
         "originator": {
             "entityType": "DEVICE",
@@ -131,7 +146,7 @@ def create_alarm_on_tb(device_name: str, alarm_type: str, ts: int, severity: str
         "details": details
     }
     response = requests.post(
-        f"{THINGSBOARD_HOST}/api/alarm",
+        f"{host}/api/alarm",
         headers={"X-Authorization": f"Bearer {token}", "Content-Type": "application/json"},
         json=alarm_payload
     )
@@ -140,7 +155,7 @@ def create_alarm_on_tb(device_name: str, alarm_type: str, ts: int, severity: str
     else:
         logger.error(f"[ALARM] Failed: {response.status_code} - {response.text}")
 
-def check_bucket_and_trigger(device: str, key: str, value: float, height: float, ts: int, floor: str):
+def check_bucket_and_trigger(device: str, key: str, value: float, height: float, ts: int, floor: str, account_id: str):
     if device not in bucket_counts:
         bucket_counts[device] = {}
     if key not in bucket_counts[device]:
@@ -159,21 +174,19 @@ def check_bucket_and_trigger(device: str, key: str, value: float, height: float,
                     "threshold": THRESHOLDS[key],
                     "floor": floor,
                     "height_zone": f"{b['center']-50:.1f} to {b['center']+50:.1f}"
-                })
+                }, account_id)
                 buckets.remove(b)
             break
 
     if not matched:
         buckets.append({"center": height, "count": 1})
 
-def process_door_alarm(device_name: str, door_open: Optional[bool], floor: str, ts: int):
+def process_door_alarm(device_name: str, door_open: Optional[bool], floor: str, ts: int, account_id: str):
     now = time.time()
     if door_open is None:
         door_open = device_door_state.get(device_name, False)
     else:
         device_door_state[device_name] = door_open
-
-    logger.info(f"[DOOR DEBUG] Device={device_name}, door_open={door_open}, open_since={door_open_since.get(device_name)}")
 
     if door_open:
         if device_name not in door_open_since:
@@ -184,8 +197,7 @@ def process_door_alarm(device_name: str, door_open: Optional[bool], floor: str, 
                 create_alarm_on_tb(device_name, "Door Open Too Long", ts, "MAJOR", {
                     "duration_sec": int(duration),
                     "floor": floor
-                })
-                logger.info(f"[DOOR] Alarm fired for {device_name}, open {duration:.1f}s")
+                }, account_id)
                 door_open_since.pop(device_name, None)
     else:
         door_open_since.pop(device_name, None)
@@ -208,9 +220,16 @@ def floor_mismatch_detected(height: float, current_floor_index: int, floor_bound
         return False, 0, 0
 
 @router.post("/check_alarm/")
-async def check_alarm(payload: TelemetryPayload, authorization: Optional[str] = Header(None)):
+async def check_alarm(
+    payload: TelemetryPayload,
+    x_account_id: str = Header(...),
+    authorization: Optional[str] = Header(None)
+):
     logger.info("--- /check_alarm/ invoked ---")
     logger.info(f"Payload received: {payload}")
+
+    if x_account_id not in ACCOUNTS:
+        raise HTTPException(status_code=400, detail="Invalid account ID")
 
     ts = int(datetime.utcnow().timestamp() * 1000)
     triggered = []
@@ -229,19 +248,19 @@ async def check_alarm(payload: TelemetryPayload, authorization: Optional[str] = 
                     "value": val,
                     "threshold": THRESHOLDS[k],
                     "floor": payload.floor
-                })
+                }, x_account_id)
 
         for key in ["x_jerk", "y_jerk", "z_jerk", "x_vibe", "y_vibe", "z_vibe"]:
             val = getattr(payload, key)
             if val is not None and val > THRESHOLDS[key]:
-                check_bucket_and_trigger(payload.deviceName, key, val, payload.height, ts, payload.floor)
+                check_bucket_and_trigger(payload.deviceName, key, val, payload.height, ts, payload.floor, x_account_id)
 
         # Floor mismatch triggers only when door is open
         is_door_open = payload.door_open or device_door_state.get(payload.deviceName, False)
         if payload.current_floor_index is not None and is_door_open:
-            device_id = get_device_id(payload.deviceName)
+            device_id = get_device_id(payload.deviceName, x_account_id)
             if device_id:
-                floor_boundaries = get_floor_boundaries(device_id)
+                floor_boundaries = get_floor_boundaries(device_id, x_account_id)
                 if floor_boundaries:
                     mismatch, deviation, floor_center = floor_mismatch_detected(payload.height, int(payload.current_floor_index), floor_boundaries)
                     if mismatch:
@@ -258,9 +277,9 @@ async def check_alarm(payload: TelemetryPayload, authorization: Optional[str] = 
                             "boundaries": floor_boundaries,
                             "deviation_mm": abs(deviation),
                             "position": position
-                        })
+                        }, x_account_id)
 
-        process_door_alarm(payload.deviceName, payload.door_open, payload.floor, ts)
+        process_door_alarm(payload.deviceName, payload.door_open, payload.floor, ts, x_account_id)
 
         logger.info(f"Triggered alarms: {triggered}")
         return {"status": "processed", "alarms_triggered": triggered}
