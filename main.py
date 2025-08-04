@@ -11,53 +11,14 @@ import os
 import requests
 import logging
 
-
+# === Logging config ===
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-
+# === FastAPI setup ===
 app = FastAPI()
 
-THINGSBOARD_ACCOUNTS = {
-    "account1": {
-        "host": os.getenv("TB1_HOST"),
-        "username": os.getenv("TB1_USERNAME"),
-        "password": os.getenv("TB1_PASSWORD")
-    },
-    "account2": {
-        "host": os.getenv("TB2_HOST"),
-        "username": os.getenv("TB2_USERNAME"),
-        "password": os.getenv("TB2_PASSWORD")
-    }
-}
-
-def get_account_creds(account_key):
-    creds = THINGSBOARD_ACCOUNTS.get(account_key)
-    if not creds:
-        raise HTTPException(status_code=400, detail="Invalid account key")
-    return creds
-
-def get_admin_token(account_key):
-    creds = get_account_creds(account_key)
-    response = requests.post(
-        f"{creds['host']}/api/auth/login",
-        json={"username": creds['username'], "password": creds['password']}
-    )
-    if response.status_code != 200:
-        raise HTTPException(status_code=response.status_code, detail="Failed login")
-    return response.json().get("token")
-
-
-@app.middleware("http")
-async def add_account_context(request: Request, call_next):
-    account_key = request.headers.get("X-TB-Account", "account1")
-    request.state.account_key = account_key
-    request.state.tb_token = get_admin_token(account_key)
-    response = await call_next(request)
-    return response
-
-
-
+# === CORS for ThingsBoard dashboard ===
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -67,15 +28,15 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-
+# === API Routers ===
 app.include_router(report_router)
 app.include_router(alarm_router)
-app.include_router(calculated_router)  
+app.include_router(calculated_router)  # ✅ Mount new calculated telemetry endpoint
 
-
+# === Cloud ThingsBoard host ===
 TB_HOST = "https://thingsboard.cloud"
 
-
+# === Global handler for FastAPI validation errors (422) ===
 @app.exception_handler(RequestValidationError)
 async def validation_exception_handler(request: Request, exc: RequestValidationError):
     logger.error(f"[VALIDATION ERROR] {exc}")
