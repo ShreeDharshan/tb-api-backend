@@ -7,7 +7,7 @@ import os
 import logging
 import time
 
-# === Logging config ===
+
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
