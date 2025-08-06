@@ -5,6 +5,7 @@ from typing import Optional
 import time
 import os
 import json
+import requests
 
 router = APIRouter()
 logger = logging.getLogger("calculated_telemetry")
@@ -31,6 +32,30 @@ class TelemetryPayload(BaseModel):
     lift_status: str
     door_open: Optional[bool] = False
     ts: Optional[int] = None
+    alarm_count: Optional[int] = 0
+    asset_id: Optional[str] = None  # Asset ID for updating attribute
+
+def update_alarm_flag(account_id: str, asset_id: str, alarm_count: int):
+    """Updates the has_critical_alarm attribute for the building asset."""
+    if not asset_id:
+        logger.warning("[update_alarm_flag] Missing asset_id, skipping update.")
+        return
+
+    base_url = ACCOUNTS[account_id]
+    url = f"{base_url}/api/plugins/telemetry/ASSET/{asset_id}/SERVER_SCOPE"
+    headers = {
+        "Content-Type": "application/json",
+        # Use a backend token from environment or service account
+        "X-Authorization": f"Bearer {os.getenv('TB_BACKEND_TOKEN', '')}"
+    }
+    data = {"has_critical_alarm": alarm_count > 0}
+
+    try:
+        resp = requests.post(url, json=data, headers=headers, timeout=5)
+        resp.raise_for_status()
+        logger.info(f"[update_alarm_flag] Updated has_critical_alarm={data['has_critical_alarm']} for asset {asset_id}")
+    except requests.RequestException as e:
+        logger.error(f"[update_alarm_flag] Failed to update attribute: {e}")
 
 @router.post("/calculated-telemetry/")
 async def calculate_telemetry(
@@ -123,6 +148,12 @@ async def calculate_telemetry(
         "door_open_count_per_floor": floor_door_counts[device_key],
         "door_open_duration_per_floor": floor_door_durations[device_key],
     }
+
+    update_alarm_flag(
+        account_id=x_account_id,
+        asset_id=payload.asset_id,
+        alarm_count=payload.alarm_count or 0
+    )
 
     return {
         "status": "success",

@@ -180,7 +180,7 @@ def check_bucket_and_trigger(device: str, key: str, value: float, height: float,
 
     if not matched:
         buckets.append({"center": height, "count": 1})
-
+   
 def process_door_alarm(device_name: str, door_open: Optional[bool], floor: str, ts: int, account_id: str):
     now = time.time()
     if door_open is None:
