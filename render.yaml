@@ -2,6 +2,7 @@ services:
   - type: web
     name: tb-api-backend
     env: python
+    runtime: python-3.11  
     plan: free
     buildCommand: |
       pip install --upgrade pip
