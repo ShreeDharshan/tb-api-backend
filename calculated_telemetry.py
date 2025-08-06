@@ -25,6 +25,9 @@ device_state = {}  # { "account:device_token": {...} }
 floor_door_counts = {}  # { "account:device_token": {...} }
 floor_door_durations = {}  # { "account:device_token": {...} }
 
+# === JWT token for admin access (backend must set this in env) ===
+BACKEND_JWT = os.getenv("TB_BACKEND_TOKEN", "")
+
 class TelemetryPayload(BaseModel):
     deviceName: str
     device_token: str
@@ -32,28 +35,47 @@ class TelemetryPayload(BaseModel):
     lift_status: str
     door_open: Optional[bool] = False
     ts: Optional[int] = None
-    alarm_count: Optional[int] = 0
-    asset_id: Optional[str] = None  # Asset ID for updating attribute
+    asset_id: Optional[str] = None  # Building asset ID
 
-def update_alarm_flag(account_id: str, asset_id: str, alarm_count: int):
+def get_active_alarm_count(account_id: str, asset_id: str):
+    """Retrieve number of active alarms for a given asset."""
+    if not BACKEND_JWT:
+        logger.warning("[get_active_alarm_count] Missing backend JWT.")
+        return 0
+
+    base_url = ACCOUNTS[account_id]
+    url = f"{base_url}/api/alarm?entityId={asset_id}&status=ACTIVE"
+    headers = {
+        "X-Authorization": f"Bearer {BACKEND_JWT}"
+    }
+
+    try:
+        resp = requests.get(url, headers=headers, timeout=5)
+        resp.raise_for_status()
+        data = resp.json()
+        return len(data.get("data", []))
+    except requests.RequestException as e:
+        logger.error(f"[get_active_alarm_count] Failed to retrieve alarms: {e}")
+        return 0
+
+def update_alarm_flag(account_id: str, asset_id: str, has_alarm: bool):
     """Updates the has_critical_alarm attribute for the building asset."""
-    if not asset_id:
-        logger.warning("[update_alarm_flag] Missing asset_id, skipping update.")
+    if not asset_id or not BACKEND_JWT:
+        logger.warning("[update_alarm_flag] Missing asset_id or JWT, skipping update.")
         return
 
     base_url = ACCOUNTS[account_id]
     url = f"{base_url}/api/plugins/telemetry/ASSET/{asset_id}/SERVER_SCOPE"
     headers = {
         "Content-Type": "application/json",
-        # Use a backend token from environment or service account
-        "X-Authorization": f"Bearer {os.getenv('TB_BACKEND_TOKEN', '')}"
+        "X-Authorization": f"Bearer {BACKEND_JWT}"
     }
-    data = {"has_critical_alarm": alarm_count > 0}
+    data = {"has_critical_alarm": has_alarm}
 
     try:
         resp = requests.post(url, json=data, headers=headers, timeout=5)
         resp.raise_for_status()
-        logger.info(f"[update_alarm_flag] Updated has_critical_alarm={data['has_critical_alarm']} for asset {asset_id}")
+        logger.info(f"[update_alarm_flag] Updated has_critical_alarm={has_alarm} for asset {asset_id}")
     except requests.RequestException as e:
         logger.error(f"[update_alarm_flag] Failed to update attribute: {e}")
 
@@ -149,11 +171,14 @@ async def calculate_telemetry(
         "door_open_duration_per_floor": floor_door_durations[device_key],
     }
 
-    update_alarm_flag(
-        account_id=x_account_id,
-        asset_id=payload.asset_id,
-        alarm_count=payload.alarm_count or 0
-    )
+    # Fetch alarm count and update has_critical_alarm attribute
+    if payload.asset_id:
+        alarm_count = get_active_alarm_count(x_account_id, payload.asset_id)
+        update_alarm_flag(
+            account_id=x_account_id,
+            asset_id=payload.asset_id,
+            has_alarm=(alarm_count > 0)
+        )
 
     return {
         "status": "success",
