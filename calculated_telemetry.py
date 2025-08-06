@@ -5,6 +5,7 @@ from typing import Optional
 import time
 import os
 import json
+from thingsboard_auth import get_admin_jwt  #
 
 router = APIRouter()
 logger = logging.getLogger("calculated_telemetry")

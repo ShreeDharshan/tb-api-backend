@@ -7,6 +7,7 @@ import os
 import logging
 import time
 import json
+from thingsboard_auth import get_admin_jwt  # ✅ Use shared auth function
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -58,48 +59,17 @@ bucket_counts = {}
 device_door_state = {}
 door_open_since = {}
 
-# Token cache per account
-admin_token_cache = {acc: {"token": None, "expiry": 0} for acc in ACCOUNTS}
-
-def get_admin_token(account_id: str) -> str:
-    """Fetch or reuse admin token for a specific ThingsBoard account."""
-    if account_id not in ACCOUNTS:
-        raise HTTPException(status_code=400, detail="Invalid account ID")
-
-    cache = admin_token_cache[account_id]
-    if cache["token"] and cache["expiry"] > time.time():
-        return cache["token"]
-    
-    host = ACCOUNTS[account_id]
-    url = f"{host}/api/auth/login"
-    credentials = {
-        "username": os.getenv(f"{account_id.upper()}_ADMIN_USER"),
-        "password": os.getenv(f"{account_id.upper()}_ADMIN_PASS")
-    }
-    logger.info(f"[ADMIN LOGIN] Logging in to ThingsBoard ({account_id})...")
-    resp = requests.post(url, json=credentials)
-    if resp.status_code != 200:
-        logger.error(f"[ADMIN LOGIN] Failed for {account_id}: {resp.status_code} - {resp.text}")
-        raise HTTPException(status_code=500, detail="Admin login failed")
-    
-    token = resp.json()["token"]
-    expires_in = resp.json().get("refreshTokenExp", 3600)
-    cache["token"] = token
-    cache["expiry"] = time.time() + (expires_in / 1000) - 60
-    logger.info(f"[ADMIN LOGIN] Admin token retrieved successfully for {account_id}")
-    return token
-
 def get_device_id(device_name: str, account_id: str) -> Optional[str]:
     cache_key = f"{account_id}:{device_name}"
     if cache_key in device_cache:
         return device_cache[cache_key]
-    
-    token = get_admin_token(account_id)
+
+    token = get_admin_jwt()
     host = ACCOUNTS[account_id]
     url = f"{host}/api/tenant/devices?deviceName={device_name}"
     res = requests.get(url, headers={"X-Authorization": f"Bearer {token}"})
     logger.info(f"[DEVICE_LOOKUP] Fetching ID for {device_name} ({account_id}) | Status: {res.status_code}")
-    
+
     if res.status_code == 200:
         try:
             device_id = res.json()["id"]["id"]
@@ -107,17 +77,17 @@ def get_device_id(device_name: str, account_id: str) -> Optional[str]:
             return device_id
         except Exception as e:
             logger.error(f"[DEVICE_LOOKUP] Failed to parse device ID: {e}")
-            return None
-    logger.error(f"[DEVICE_LOOKUP] Failed: {res.status_code} | {res.text}")
+    else:
+        logger.error(f"[DEVICE_LOOKUP] Failed: {res.status_code} | {res.text}")
     return None
 
 def get_floor_boundaries(device_id: str, account_id: str) -> Optional[str]:
-    token = get_admin_token(account_id)
+    token = get_admin_jwt()
     host = ACCOUNTS[account_id]
     url = f"{host}/api/plugins/telemetry/DEVICE/{device_id}/values/attributes/SERVER_SCOPE"
     res = requests.get(url, headers={"X-Authorization": f"Bearer {token}"})
     logger.info(f"[ATTRIBUTES] Fetching floor boundaries ({account_id}) | Status: {res.status_code}")
-    
+
     if res.status_code == 200:
         try:
             for attr in res.json():
@@ -132,8 +102,8 @@ def create_alarm_on_tb(device_name: str, alarm_type: str, ts: int, severity: str
     if not device_id:
         logger.warning(f"[ALARM] Could not fetch device ID for {device_name}")
         return
-    
-    token = get_admin_token(account_id)
+
+    token = get_admin_jwt()
     host = ACCOUNTS[account_id]
     alarm_payload = {
         "originator": {
@@ -180,7 +150,7 @@ def check_bucket_and_trigger(device: str, key: str, value: float, height: float,
 
     if not matched:
         buckets.append({"center": height, "count": 1})
-   
+
 def process_door_alarm(device_name: str, door_open: Optional[bool], floor: str, ts: int, account_id: str):
     now = time.time()
     if door_open is None:
@@ -206,7 +176,7 @@ def floor_mismatch_detected(height: float, current_floor_index: int, floor_bound
     try:
         if height is None or current_floor_index is None:
             return False, 0, 0
-        
+
         floor_boundaries = [float(x.strip()) for x in floor_boundaries_str.split(",") if x.strip()]
         if current_floor_index >= len(floor_boundaries):
             return True, 0, 0
@@ -255,7 +225,6 @@ async def check_alarm(
             if val is not None and val > THRESHOLDS[key]:
                 check_bucket_and_trigger(payload.deviceName, key, val, payload.height, ts, payload.floor, x_account_id)
 
-        # Floor mismatch triggers only when door is open
         is_door_open = payload.door_open or device_door_state.get(payload.deviceName, False)
         if payload.current_floor_index is not None and is_door_open:
             device_id = get_device_id(payload.deviceName, x_account_id)

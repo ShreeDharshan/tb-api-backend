@@ -7,6 +7,7 @@ import os
 import json
 from openpyxl.worksheet.table import Table, TableStyleInfo
 from openpyxl.utils import get_column_letter
+from thingsboard_auth import get_admin_jwt  # ✅ Import shared auth
 
 # === Load Multi-Account Configuration ===
 try:
@@ -19,11 +20,11 @@ except json.JSONDecodeError:
 router = APIRouter()
 
 class ReportRequest(BaseModel):
-    device_name:    str
-    data_types:     list[str]
+    device_name: str
+    data_types: list[str]
     include_alarms: bool
-    start_date:     str 
-    end_date:       str  
+    start_date: str
+    end_date: str
 
 VIBE_KEY_MAP = {
     'x_vibration': 'x_vibe',
@@ -63,13 +64,13 @@ def fetch_telemetry(jwt_token: str, device_id: str, keys: list[str],
                     start_ts: datetime.datetime, end_ts: datetime.datetime, account_id: str):
     host = ACCOUNTS[account_id]
     headers = {"X-Authorization": f"Bearer {jwt_token}"}
-    params  = {
-        "keys":    ",".join(keys),
+    params = {
+        "keys": ",".join(keys),
         "startTs": int(start_ts.timestamp() * 1000),
-        "endTs":   int(end_ts.timestamp()   * 1000),
+        "endTs": int(end_ts.timestamp() * 1000),
         "interval": 1000,
-        "limit":    10000,
-        "agg":      "NONE"
+        "limit": 10000,
+        "agg": "NONE"
     }
     url = f"{host}/api/plugins/telemetry/DEVICE/{device_id}/values/timeseries"
     resp = requests.get(url, headers=headers, params=params)
@@ -92,40 +93,40 @@ def fetch_alarms(jwt_token: str, device_id: str,
 
 def fetch_all_attributes(jwt_token: str, device_id: str, account_id: str) -> dict:
     host = ACCOUNTS[account_id]
-    headers  = {"X-Authorization": f"Bearer {jwt_token}"}
+    headers = {"X-Authorization": f"Bearer {jwt_token}"}
     combined = {}
     for scope in ("SERVER_SCOPE", "SHARED_SCOPE", "CLIENT_SCOPE"):
-        url  = f"{host}/api/plugins/telemetry/DEVICE/{device_id}/values/attributes/{scope}"
+        url = f"{host}/api/plugins/telemetry/DEVICE/{device_id}/values/attributes/{scope}"
         resp = requests.get(url, headers=headers)
         resp.raise_for_status()
         for entry in resp.json():
             combined[entry["key"]] = entry["value"]
     return combined
-    
+
 @router.post("/generate_report/")
 def generate_report(
-    request: ReportRequest, 
+    request: ReportRequest,
     authorization: str = Header(...),
     x_account_id: str = Header(...)
 ):
     if x_account_id not in ACCOUNTS:
         raise HTTPException(status_code=400, detail="Invalid account ID")
-    
+
     if not authorization.startswith("Bearer "):
         raise HTTPException(status_code=400, detail="Missing Bearer token")
-    
+
     jwt_token = authorization.split(" ", 1)[1]
-    user        = extract_jwt_user_info(jwt_token, x_account_id)
-    authority   = user.get("authority", "")
+    user = extract_jwt_user_info(jwt_token, x_account_id)
+    authority = user.get("authority", "")
     customer_id = user.get("customerId", {}).get("id", None)
-    device_id   = get_permitted_device_id(jwt_token, request.device_name, authority, x_account_id, customer_id)
+    device_id = get_permitted_device_id(jwt_token, request.device_name, authority, x_account_id, customer_id)
 
     start_ts = datetime.datetime.strptime(request.start_date, "%Y-%m-%d")
-    end_ts   = datetime.datetime.strptime(request.end_date,   "%Y-%m-%d")
+    end_ts = datetime.datetime.strptime(request.end_date, "%Y-%m-%d")
 
-    attrs         = fetch_all_attributes(jwt_token, device_id, x_account_id)
-    normalized    = [VIBE_KEY_MAP.get(k, k) for k in request.data_types]
-    telemetry     = fetch_telemetry(jwt_token, device_id, normalized, start_ts, end_ts, x_account_id)
+    attrs = fetch_all_attributes(jwt_token, device_id, x_account_id)
+    normalized = [VIBE_KEY_MAP.get(k, k) for k in request.data_types]
+    telemetry = fetch_telemetry(jwt_token, device_id, normalized, start_ts, end_ts, x_account_id)
 
     df = pd.concat([
         pd.DataFrame(entries)
@@ -142,16 +143,16 @@ def generate_report(
             df[friendly] = pd.NA
 
     timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-    filename  = f"{request.device_name}_report_{timestamp}.xlsx"
-    filepath  = os.path.join(os.getcwd(), filename)
+    filename = f"{request.device_name}_report_{timestamp}.xlsx"
+    filepath = os.path.join(os.getcwd(), filename)
 
     with pd.ExcelWriter(filepath, engine="openpyxl") as writer:
-        sheet   = "Report"
-        attr_df = pd.DataFrame(list(attrs.items()), columns=["Attribute","Value"])
+        sheet = "Report"
+        attr_df = pd.DataFrame(list(attrs.items()), columns=["Attribute", "Value"])
         attr_df.to_excel(writer, sheet_name=sheet, index=False, startrow=0)
 
         startrow = len(attr_df) + 3
-        tele_df  = df.reset_index()
+        tele_df = df.reset_index()
         tele_df.to_excel(writer, sheet_name=sheet, index=False, startrow=startrow, na_rep="N")
 
         wb = writer.book
@@ -163,9 +164,9 @@ def generate_report(
         ws.add_table(attr_table)
 
         nrows, ncols = tele_df.shape
-        last_col     = get_column_letter(ncols)
-        tele_ref     = f"A{startrow+1}:{last_col}{startrow+nrows}"
-        tele_table   = Table(displayName="TelemetryTable", ref=tele_ref)
+        last_col = get_column_letter(ncols)
+        tele_ref = f"A{startrow+1}:{last_col}{startrow+nrows}"
+        tele_table = Table(displayName="TelemetryTable", ref=tele_ref)
         tele_table.tableStyleInfo = TableStyleInfo(name="TableStyleMedium9", showRowStripes=True)
         ws.add_table(tele_table)
 
@@ -173,18 +174,18 @@ def generate_report(
             alarms = fetch_alarms(jwt_token, device_id, start_ts, end_ts, x_account_id)
             if alarms:
                 alarm_df = pd.DataFrame([{
-                    "ts":       datetime.datetime.fromtimestamp(a["createdTime"]/1000),
-                    "type":     a["type"],
+                    "ts": datetime.datetime.fromtimestamp(a["createdTime"]/1000),
+                    "type": a["type"],
                     "severity": a["severity"],
-                    "status":   a["status"]
+                    "status": a["status"]
                 } for a in alarms])
             else:
-                alarm_df = pd.DataFrame([{"Notice":"No alarms during selected period."}])
+                alarm_df = pd.DataFrame([{"Notice": "No alarms during selected period."}])
             alarm_df.to_excel(writer, sheet_name="Alarms", index=False)
 
     return {
-        "status":       "success",
-        "filename":     filename,
+        "status": "success",
+        "filename": filename,
         "download_url": f"/download/{filename}",
-        "sheets":       [sheet] + (["Alarms"] if request.include_alarms else [])
+        "sheets": [sheet] + (["Alarms"] if request.include_alarms else [])
     }

@@ -6,7 +6,8 @@ from fastapi.encoders import jsonable_encoder
 from starlette.requests import Request
 from report_logic import router as report_router, extract_jwt_user_info
 from alarm_logic import router as alarm_router
-from calculated_telemetry import router as calculated_router  
+from calculated_telemetry import router as calculated_router
+from thingsboard_auth import get_admin_jwt  # ✅ Import shared JWT helper
 import os
 import requests
 import logging
@@ -34,7 +35,7 @@ app.include_router(alarm_router)
 app.include_router(calculated_router)  # ✅ Mount new calculated telemetry endpoint
 
 # === Cloud ThingsBoard host ===
-TB_HOST = "https://thingsboard.cloud"
+TB_HOST = os.getenv("TB_BASE_URL", "https://thingsboard.cloud")
 
 # === Global handler for FastAPI validation errors (422) ===
 @app.exception_handler(RequestValidationError)
@@ -55,8 +56,8 @@ def get_my_devices(authorization: str = Header(...)):
         raise HTTPException(status_code=400, detail="Missing Bearer token")
     jwt_token = authorization.split(" ", 1)[1]
 
-    user_info   = extract_jwt_user_info(jwt_token)
-    authority   = user_info.get("authority", "")
+    user_info = extract_jwt_user_info(jwt_token)
+    authority = user_info.get("authority", "")
     customer_id = user_info.get("customerId", {}).get("id", "")
 
     headers = {"X-Authorization": f"Bearer {jwt_token}"}
@@ -89,3 +90,12 @@ def download_csv(filename: str):
 @app.get("/healthcheck")
 def health_check():
     return {"status": "ok"}
+
+# === Admin JWT health check (optional) ===
+@app.get("/admin_jwt_status")
+def admin_jwt_status():
+    token = get_admin_jwt()
+    if token:
+        return {"status": "success", "message": "Admin JWT retrieved successfully"}
+    else:
+        raise HTTPException(status_code=500, detail="Failed to retrieve Admin JWT")
