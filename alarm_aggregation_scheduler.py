@@ -73,16 +73,16 @@ def get_related_entities(base_url, entity_id, headers):
         return []
 
 def get_active_alarm_count(base_url, device_id, headers):
-    url = f"{base_url}/api/alarm"
-    params = {
+    url = f"{base_url}/api/alarm/QUERY"
+    payload = {
+        "pageSize": 100,
+        "page": 0,
         "searchStatus": "ACTIVE",
         "entityId": device_id,
-        "entityType": "DEVICE",
-        "pageSize": 100,
-        "page": 0
+        "entityType": "DEVICE"
     }
     try:
-        resp = requests.get(url, headers=headers, params=params, timeout=5)
+        resp = requests.post(url, headers={**headers, "Content-Type": "application/json"}, json=payload, timeout=5)
         resp.raise_for_status()
         data = resp.json()
         return len(data.get("data", []))
