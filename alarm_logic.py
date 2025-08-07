@@ -1,6 +1,6 @@
 from fastapi import APIRouter, Header, HTTPException
 from pydantic import BaseModel, Field
-from typing import Optional, Tuple
+from typing import Optional, Union, Tuple
 from datetime import datetime
 import requests
 import os
@@ -42,22 +42,28 @@ class TelemetryPayload(BaseModel):
     deviceName: str = Field(...)
     floor: str = Field(...)
     timestamp: str = Field(...)
-    height: float = Field(...)
-    current_floor_index: Optional[int] = Field(default=None)
-    x_vibe: Optional[float] = Field(default=None)
-    y_vibe: Optional[float] = Field(default=None)
-    z_vibe: Optional[float] = Field(default=None)
-    x_jerk: Optional[float] = Field(default=None)
-    y_jerk: Optional[float] = Field(default=None)
-    z_jerk: Optional[float] = Field(default=None)
-    temperature: Optional[float] = Field(default=None)
-    humidity: Optional[float] = Field(default=None)
-    door_open: Optional[bool] = Field(default=None)
+    height: Optional[Union[float, str]] = Field(default=None)
+    current_floor_index: Optional[Union[int, str]] = Field(default=None)
+    x_vibe: Optional[Union[float, str]] = Field(default=None)
+    y_vibe: Optional[Union[float, str]] = Field(default=None)
+    z_vibe: Optional[Union[float, str]] = Field(default=None)
+    x_jerk: Optional[Union[float, str]] = Field(default=None)
+    y_jerk: Optional[Union[float, str]] = Field(default=None)
+    z_jerk: Optional[Union[float, str]] = Field(default=None)
+    temperature: Optional[Union[float, str]] = Field(default=None)
+    humidity: Optional[Union[float, str]] = Field(default=None)
+    door_open: Optional[Union[bool, str]] = Field(default=None)
 
 device_cache = {}
 bucket_counts = {}
 device_door_state = {}
 door_open_since = {}
+
+def parse_float(value):
+    try:
+        return float(value)
+    except (ValueError, TypeError):
+        return None
 
 def get_device_id(device_name: str, account_id: str) -> Optional[str]:
     cache_key = f"{account_id}:{device_name}"
@@ -205,8 +211,11 @@ async def check_alarm(
     triggered = []
 
     try:
+        height = parse_float(payload.height)
+        current_floor_index = int(payload.current_floor_index) if payload.current_floor_index is not None else None
+
         for k in ["humidity", "temperature"]:
-            val = getattr(payload, k)
+            val = parse_float(getattr(payload, k))
             if val is not None and val > THRESHOLDS[k]:
                 triggered.append({
                     "type": f"{k.capitalize()} Alarm",
@@ -221,28 +230,28 @@ async def check_alarm(
                 }, x_account_id)
 
         for key in ["x_jerk", "y_jerk", "z_jerk", "x_vibe", "y_vibe", "z_vibe"]:
-            val = getattr(payload, key)
+            val = parse_float(getattr(payload, key))
             if val is not None and val > THRESHOLDS[key]:
-                check_bucket_and_trigger(payload.deviceName, key, val, payload.height, ts, payload.floor, x_account_id)
+                check_bucket_and_trigger(payload.deviceName, key, val, height, ts, payload.floor, x_account_id)
 
         is_door_open = payload.door_open or device_door_state.get(payload.deviceName, False)
-        if payload.current_floor_index is not None and is_door_open:
+        if current_floor_index is not None and is_door_open:
             device_id = get_device_id(payload.deviceName, x_account_id)
             if device_id:
                 floor_boundaries = get_floor_boundaries(device_id, x_account_id)
                 if floor_boundaries:
-                    mismatch, deviation, floor_center = floor_mismatch_detected(payload.height, int(payload.current_floor_index), floor_boundaries)
+                    mismatch, deviation, floor_center = floor_mismatch_detected(height, current_floor_index, floor_boundaries)
                     if mismatch:
                         position = "above" if deviation > 0 else "below"
                         triggered.append({
                             "type": "Floor Mismatch Alarm",
-                            "value": payload.height,
+                            "value": height,
                             "severity": "CRITICAL",
                             "position": position
                         })
                         create_alarm_on_tb(payload.deviceName, "Floor Mismatch Alarm", ts, "CRITICAL", {
-                            "reported_index": payload.current_floor_index,
-                            "height": payload.height,
+                            "reported_index": current_floor_index,
+                            "height": height,
                             "boundaries": floor_boundaries,
                             "deviation_mm": abs(deviation),
                             "position": position
