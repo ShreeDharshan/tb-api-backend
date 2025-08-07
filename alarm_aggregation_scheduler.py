@@ -73,14 +73,25 @@ def get_related_entities(base_url, entity_id, headers):
         return []
 
 def get_active_alarm_count(base_url, device_id, headers):
-    url = f"{base_url}/api/alarm?entityId={device_id}&status=ACTIVE"
+    url = f"{base_url}/api/alarm"
+    body = {
+        "searchStatus": "ACTIVE",
+        "entityId": {
+            "entityType": "DEVICE",
+            "id": device_id
+        },
+        "pageSize": 100,
+        "page": 0
+    }
     try:
-        resp = requests.get(url, headers=headers, timeout=5)
+        resp = requests.post(url, headers={**headers, "Content-Type": "application/json"}, json=body, timeout=5)
         resp.raise_for_status()
-        return len(resp.json().get("data", []))
+        data = resp.json()
+        return len(data.get("data", []))
     except requests.RequestException as e:
         logger.warning(f"[Alarms] Failed to get alarms for device {device_id}: {e}")
         return 0
+
 
 def update_asset_alarm_count(base_url, asset_id, count, headers):
     url = f"{base_url}/api/plugins/telemetry/ASSET/{asset_id}/SERVER_SCOPE"
