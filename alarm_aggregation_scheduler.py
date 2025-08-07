@@ -81,13 +81,12 @@ def get_active_alarm_count(base_url, device_id, headers):
         # Correct ThingsBoard API requires 'page' and 'pageSize'
         url = f"{base_url}/api/alarm/DEVICE/{device_id}?ps=100&page=0"
 
-        # Make the GET request to fetch alarms
         resp = requests.get(url, headers=headers, timeout=5)
         resp.raise_for_status()
 
-        # Parse JSON response and count only active alarms
-        data = resp.json()
-        alarms = data.get("data", [])
+        # FIX: Access the 'data' key correctly
+        alarms_data = resp.json()
+        alarms = alarms_data.get("data", [])
 
         active_alarms_count = sum(
             1 for alarm in alarms if alarm.get("status") in ["ACTIVE_UNACK", "ACTIVE_ACK"]
@@ -97,6 +96,10 @@ def get_active_alarm_count(base_url, device_id, headers):
     except requests.RequestException as e:
         logger.warning(f"[Alarms] Failed to get alarms for device {device_id}: {e}")
         return 0
+    except Exception as e:
+        logger.error(f"[Alarms] Unexpected error for device {device_id}: {e}")
+        return 0
+
 
 
 def update_asset_alarm_count(base_url, asset_id, count, headers):
