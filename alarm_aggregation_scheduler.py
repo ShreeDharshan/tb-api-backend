@@ -11,7 +11,7 @@ SCAN_INTERVAL = int(os.getenv("TB_SCHEDULER_INTERVAL", "30"))  # seconds
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("alarm_scheduler")
 
-# === Control event for stopping the scheduler gracefully ===
+
 stop_event = threading.Event()
 
 def scheduler():
@@ -73,26 +73,28 @@ def get_related_entities(base_url, entity_id, headers):
         return []
 
 def get_active_alarm_count(base_url, device_id, headers):
-    url = f"{base_url}/api/alarm/QUERY"  
-    body = {
+    url = f"{base_url}/api/alarm/QUERY"
+    query_payload = {
+        "page": 0,
+        "pageSize": 100,
+        "sortOrder": {
+            "property": "startTs",
+            "direction": "DESC"
+        },
         "searchStatus": "ACTIVE",
         "entityId": {
             "entityType": "DEVICE",
             "id": device_id
-        },
-        "pageSize": 100,
-        "page": 0
+        }
     }
     try:
-        resp = requests.post(url, headers={**headers, "Content-Type": "application/json"}, json=body, timeout=5)
+        resp = requests.post(url, headers={**headers, "Content-Type": "application/json"}, json=query_payload, timeout=5)
         resp.raise_for_status()
         data = resp.json()
         return len(data.get("data", []))
     except requests.RequestException as e:
         logger.warning(f"[Alarms] Failed to get alarms for device {device_id}: {e}")
         return 0
-
-
 
 def update_asset_alarm_count(base_url, asset_id, count, headers):
     url = f"{base_url}/api/plugins/telemetry/ASSET/{asset_id}/SERVER_SCOPE"
