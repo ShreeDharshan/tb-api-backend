@@ -6,7 +6,6 @@ import threading
 from thingsboard_auth import get_admin_jwt
 from config import TB_ACCOUNTS
 
-
 SCAN_INTERVAL = int(os.getenv("TB_SCHEDULER_INTERVAL", "30"))  # seconds
 
 logging.basicConfig(level=logging.INFO)
@@ -14,7 +13,6 @@ logger = logging.getLogger("alarm_scheduler")
 
 # === Control event for stopping the scheduler gracefully ===
 stop_event = threading.Event()
-
 
 def scheduler():
     logger.info("[Scheduler] Starting alarm aggregation loop...")
@@ -41,7 +39,6 @@ def scheduler():
 
     logger.info("[Scheduler] Stopped gracefully.")
 
-
 def get_all_assets(base_url, headers):
     logger.info("[Assets] Fetching all assets...")
     url = f"{base_url}/api/tenant/assets?pageSize=500&page=0"
@@ -49,24 +46,24 @@ def get_all_assets(base_url, headers):
     resp.raise_for_status()
     return resp.json().get("data", [])
 
-
 def aggregate_alarm_count(base_url, entity_id, headers):
     total = 0
     children = get_related_entities(base_url, entity_id, headers)
 
     for child in children:
-        child_id = child['id']['id']
-        if child['entityType'] == 'DEVICE':
+        child_id = child['to']['id']
+        entity_type = child['to']['entityType']
+
+        if entity_type == 'DEVICE':
             count = get_active_alarm_count(base_url, child_id, headers)
             total += count
-        elif child['entityType'] == 'ASSET':
+        elif entity_type == 'ASSET':
             total += aggregate_alarm_count(base_url, child_id, headers)
 
     return total
 
-
 def get_related_entities(base_url, entity_id, headers):
-    url = f"{base_url}/api/relations/info?id={entity_id}&relationType=Contains&direction=FROM"
+    url = f"{base_url}/api/relations?fromId={entity_id}&fromType=ASSET"
     try:
         resp = requests.get(url, headers=headers, timeout=5)
         resp.raise_for_status()
@@ -75,18 +72,15 @@ def get_related_entities(base_url, entity_id, headers):
         logger.warning(f"[Relations] Failed for {entity_id}: {e}")
         return []
 
-
 def get_active_alarm_count(base_url, device_id, headers):
     url = f"{base_url}/api/alarm?entityId={device_id}&status=ACTIVE"
     try:
         resp = requests.get(url, headers=headers, timeout=5)
         resp.raise_for_status()
-        data = resp.json()
-        return len(data.get("data", []))
+        return len(resp.json().get("data", []))
     except requests.RequestException as e:
         logger.warning(f"[Alarms] Failed to get alarms for device {device_id}: {e}")
         return 0
-
 
 def update_asset_alarm_count(base_url, asset_id, count, headers):
     url = f"{base_url}/api/plugins/telemetry/ASSET/{asset_id}/SERVER_SCOPE"
@@ -100,7 +94,6 @@ def update_asset_alarm_count(base_url, asset_id, count, headers):
         logger.info(f"[Update] Asset {asset_id} updated with count={count}")
     except requests.RequestException as e:
         logger.warning(f"[Update] Failed to update asset {asset_id}: {e}")
-
 
 def stop_scheduler():
     logger.info("[Scheduler] Stop signal received.")
