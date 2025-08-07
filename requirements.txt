@@ -5,3 +5,5 @@ requests
 python-multipart
 openpyxl
 pydantic>=2.4.0  
+python-dotenv
+

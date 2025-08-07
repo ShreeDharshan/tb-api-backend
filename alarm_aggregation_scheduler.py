@@ -4,7 +4,8 @@ import requests
 import logging
 import threading
 from thingsboard_auth import get_admin_jwt
-from main import TB_ACCOUNTS
+from config import TB_ACCOUNTS
+
 
 SCAN_INTERVAL = int(os.getenv("TB_SCHEDULER_INTERVAL", "30"))  # seconds
 

@@ -9,6 +9,8 @@ from alarm_logic import router as alarm_router
 from calculated_telemetry import router as calculated_router
 from thingsboard_auth import get_admin_jwt
 from alarm_aggregation_scheduler import scheduler, stop_scheduler
+from config import TB_ACCOUNTS
+
 
 import threading
 import os
