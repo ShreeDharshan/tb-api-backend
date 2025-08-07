@@ -12,7 +12,7 @@ SCAN_INTERVAL = int(os.getenv("TB_SCHEDULER_INTERVAL", "30"))  # seconds
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("alarm_scheduler")
 
-
+# === Control event for stopping the scheduler gracefully ===
 stop_event = threading.Event()
 
 def scheduler():
@@ -56,7 +56,7 @@ def aggregate_alarm_count(base_url, entity_id, headers):
         entity_type = child['to']['entityType']
 
         if entity_type == 'DEVICE':
-            count = get_active_alarm_count(base_url, child_id, headers)
+            count = get_device_active_alarm_count(base_url, child_id, headers)
             total += count
         elif entity_type == 'ASSET':
             total += aggregate_alarm_count(base_url, child_id, headers)
@@ -73,37 +73,30 @@ def get_related_entities(base_url, entity_id, headers):
         logger.warning(f"[Relations] Failed for {entity_id}: {e}")
         return []
 
-def get_active_alarm_count(base_url, device_id, headers):
-    """
-    Gets the count of active alarms for a specific device using the correct POST API.
-    """
-    url = f"{base_url}/api/alarm"
-
-    body = {
-        "searchStatus": "ACTIVE",
-        "entityId": {
-            "entityType": "DEVICE",
-            "id": device_id
-        },
+def get_device_active_alarm_count(base_url, device_id, headers):
+    url = f"{base_url}/api/alarm/DEVICE/{device_id}"
+    params = {
         "pageSize": 100,
-        "page": 0
+        "page": 0,
+        "searchStatus": "ACTIVE"
     }
 
     try:
-        resp = requests.post(url, headers={**headers, "Content-Type": "application/json"}, json=body, timeout=10)
+        resp = requests.get(url, headers=headers, params=params, timeout=10)
         resp.raise_for_status()
-
         data = resp.json()
-        alarms = data.get("data", [])
-        active_alarms_count = sum(
-            1 for alarm in alarms if alarm.get("status") in ["ACTIVE_UNACK", "ACTIVE_ACK"]
-        )
-        return active_alarms_count
+
+        active_alarms = [
+            alarm for alarm in data.get("data", [])
+            if alarm.get("status") in ["ACTIVE_UNACK", "ACTIVE_ACK"]
+        ]
+
+        logger.info(f"[Alarms] Device {device_id} has {len(active_alarms)} active alarms")
+        return len(active_alarms)
 
     except requests.RequestException as e:
         logger.warning(f"[Alarms] Failed to get alarms for device {device_id}: {e}")
         return 0
-
 
 def update_asset_alarm_count(base_url, asset_id, count, headers):
     url = f"{base_url}/api/plugins/telemetry/ASSET/{asset_id}/SERVER_SCOPE"
