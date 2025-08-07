@@ -70,7 +70,7 @@ def get_device_id(device_name: str, account_id: str) -> Optional[str]:
     if cache_key in device_cache:
         return device_cache[cache_key]
 
-    token = get_admin_jwt()
+    token = get_admin_jwt(account_id, ACCOUNTS[account_id])
     host = ACCOUNTS[account_id]
     url = f"{host}/api/tenant/devices?deviceName={device_name}"
     res = requests.get(url, headers={"X-Authorization": f"Bearer {token}"})
@@ -88,7 +88,7 @@ def get_device_id(device_name: str, account_id: str) -> Optional[str]:
     return None
 
 def get_floor_boundaries(device_id: str, account_id: str) -> Optional[str]:
-    token = get_admin_jwt()
+    token = get_admin_jwt(account_id, ACCOUNTS[account_id])
     host = ACCOUNTS[account_id]
     url = f"{host}/api/plugins/telemetry/DEVICE/{device_id}/values/attributes/SERVER_SCOPE"
     res = requests.get(url, headers={"X-Authorization": f"Bearer {token}"})
@@ -109,7 +109,7 @@ def create_alarm_on_tb(device_name: str, alarm_type: str, ts: int, severity: str
         logger.warning(f"[ALARM] Could not fetch device ID for {device_name}")
         return
 
-    token = get_admin_jwt()
+    token = get_admin_jwt(account_id, ACCOUNTS[account_id])
     host = ACCOUNTS[account_id]
     alarm_payload = {
         "originator": {
