@@ -75,31 +75,34 @@ def get_related_entities(base_url, entity_id, headers):
 
 def get_active_alarm_count(base_url, device_id, headers):
     """
-    Gets the count of active alarms for a specific device.
+    Gets the count of active alarms for a specific device using the correct POST API.
     """
+    url = f"{base_url}/api/alarm"
+
+    body = {
+        "searchStatus": "ACTIVE",
+        "entityId": {
+            "entityType": "DEVICE",
+            "id": device_id
+        },
+        "pageSize": 100,
+        "page": 0
+    }
+
     try:
-        url = f"{base_url}/api/alarm/DEVICE/{device_id}?ps=100&page=0"
-        resp = requests.get(url, headers=headers, timeout=10)
+        resp = requests.post(url, headers={**headers, "Content-Type": "application/json"}, json=body, timeout=10)
         resp.raise_for_status()
 
-    
-        alarm_page = resp.json()
-        alarms = alarm_page.get("data", [])
-
-        
+        data = resp.json()
+        alarms = data.get("data", [])
         active_alarms_count = sum(
             1 for alarm in alarms if alarm.get("status") in ["ACTIVE_UNACK", "ACTIVE_ACK"]
         )
-
         return active_alarms_count
+
     except requests.RequestException as e:
         logger.warning(f"[Alarms] Failed to get alarms for device {device_id}: {e}")
         return 0
-    except Exception as e:
-        logger.error(f"[Alarms] Unexpected error for device {device_id}: {e}")
-        return 0
-
-
 
 
 def update_asset_alarm_count(base_url, asset_id, count, headers):
