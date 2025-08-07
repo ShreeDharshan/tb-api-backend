@@ -1,39 +1,21 @@
 import os
-import requests
 import logging
-from pydantic import BaseModel, Field
-
+import requests
 
 logger = logging.getLogger("thingsboard_auth")
 
-# === Environment Variables ===
-THINGSBOARD_URL = os.getenv("TB_BASE_URL", "https://thingsboard.cloud")
-ADMIN_USER = os.getenv("TB_ADMIN_USER", "")
-ADMIN_PASS = os.getenv("TB_ADMIN_PASS", "")
+# DEBUG: Print values at startup
+print("DEBUG: ACCOUNT1_ADMIN_USER =", os.environ.get("ACCOUNT1_ADMIN_USER"))
+print("DEBUG: ACCOUNT1_ADMIN_PASS =", os.environ.get("ACCOUNT1_ADMIN_PASS"))
 
-if not ADMIN_USER or not ADMIN_PASS:
-    logger.warning("[Auth] TB_ADMIN_USER or TB_ADMIN_PASS not set in environment variables.")
-
-def get_admin_jwt():
-    """
-    Retrieves an admin JWT token from ThingsBoard for API authentication.
-    Uses credentials from environment variables.
-    """
-    url = f"{THINGSBOARD_URL}/api/auth/login"
-    payload = {
-        "username": ADMIN_USER,
-        "password": ADMIN_PASS
-    }
+def login_to_thingsboard(base_url: str, username: str, password: str):
+    url = f"{base_url}/api/auth/login"
+    payload = {"username": username, "password": password}
     try:
-        resp = requests.post(url, json=payload, timeout=5)
-        resp.raise_for_status()
-        token = resp.json().get("token")
-        if token:
-            logger.info("[Auth] Admin JWT retrieved successfully.")
-            return token
-        else:
-            logger.error("[Auth] No token found in response.")
-            return None
-    except requests.RequestException as e:
+        response = requests.post(url, json=payload)
+        response.raise_for_status()
+        jwt_token = response.json().get("token")
+        return jwt_token
+    except requests.exceptions.HTTPError as e:
         logger.error(f"[Auth] Failed to retrieve JWT: {e}")
         return None
