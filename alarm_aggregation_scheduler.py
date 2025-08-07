@@ -75,28 +75,29 @@ def get_related_entities(base_url, entity_id, headers):
 
 def get_active_alarm_count(base_url, device_id, headers):
     """
-    Gets the count of active alarms for a specific device within a specified time range.
+    Gets the count of all active alarms for a specific device.
     """
     try:
-        # Calculate the time range (e.g., last 24 hours)
-        end_time = int(time.time() * 1000)  # Current time in milliseconds
-        start_time = end_time - 24 * 60 * 60 * 1000  # 24 hours ago
-
-        # Construct the URL for fetching alarms for a specific device
-        url = f"{base_url}/api/alarm/DEVICE/{device_id}?ps=100&startTs={start_time}&endTs={end_time}"
+        # Correct ThingsBoard API requires 'page' and 'pageSize'
+        url = f"{base_url}/api/alarm/DEVICE/{device_id}?ps=100&page=0"
 
         # Make the GET request to fetch alarms
         resp = requests.get(url, headers=headers, timeout=5)
-        resp.raise_for_status()  # Raise HTTPError for bad responses (4xx or 5xx)
+        resp.raise_for_status()
 
-        # Parse the JSON response and count the alarms with an "ACTIVE" status
-        alarms = resp.json()
-        active_alarms_count = sum(1 for alarm in alarms if alarm.get("status") in ["ACTIVE_UNACK", "ACTIVE_ACK"])
+        # Parse JSON response and count only active alarms
+        data = resp.json()
+        alarms = data.get("data", [])
+
+        active_alarms_count = sum(
+            1 for alarm in alarms if alarm.get("status") in ["ACTIVE_UNACK", "ACTIVE_ACK"]
+        )
 
         return active_alarms_count
     except requests.RequestException as e:
         logger.warning(f"[Alarms] Failed to get alarms for device {device_id}: {e}")
         return 0
+
 
 def update_asset_alarm_count(base_url, asset_id, count, headers):
     url = f"{base_url}/api/plugins/telemetry/ASSET/{asset_id}/SERVER_SCOPE"
