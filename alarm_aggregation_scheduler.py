@@ -73,7 +73,7 @@ def get_related_entities(base_url, entity_id, headers):
         return []
 
 def get_active_alarm_count(base_url, device_id, headers):
-    url = f"{base_url}/api/alarm"
+    url = f"{base_url}/api/alarm/QUERY"  
     body = {
         "searchStatus": "ACTIVE",
         "entityId": {
@@ -91,6 +91,7 @@ def get_active_alarm_count(base_url, device_id, headers):
     except requests.RequestException as e:
         logger.warning(f"[Alarms] Failed to get alarms for device {device_id}: {e}")
         return 0
+
 
 
 def update_asset_alarm_count(base_url, asset_id, count, headers):
