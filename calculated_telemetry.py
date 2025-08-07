@@ -1,6 +1,6 @@
 import logging
 from fastapi import APIRouter, Header, HTTPException
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from typing import Optional
 import time
 import os
@@ -25,13 +25,17 @@ device_state = {}  # { "account:device_token": {...} }
 floor_door_counts = {}  # { "account:device_token": {...} }
 floor_door_durations = {}  # { "account:device_token": {...} }
 
+from pydantic import BaseModel, Field
+from typing import Optional
+
 class TelemetryPayload(BaseModel):
-    deviceName: str
-    device_token: str
-    current_floor_index: int
-    lift_status: str
-    door_open: Optional[bool] = False
-    ts: Optional[int] = None
+    deviceName: str = Field(...)
+    device_token: str = Field(...)
+    current_floor_index: int = Field(...)
+    lift_status: str = Field(...)
+    door_open: Optional[bool] = Field(default=False)
+    ts: Optional[int] = Field(default=None)
+
 
 @router.post("/calculated-telemetry/")
 async def calculate_telemetry(

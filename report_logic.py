@@ -1,5 +1,5 @@
 from fastapi import APIRouter, Header, HTTPException
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 import requests
 import pandas as pd
 import datetime
@@ -19,12 +19,15 @@ except json.JSONDecodeError:
 
 router = APIRouter()
 
+from pydantic import BaseModel, Field
+
 class ReportRequest(BaseModel):
-    device_name: str
-    data_types: list[str]
-    include_alarms: bool
-    start_date: str
-    end_date: str
+    device_name: str = Field(...)
+    data_types: list[str] = Field(...)
+    include_alarms: bool = Field(...)
+    start_date: str = Field(...)
+    end_date: str = Field(...)
+
 
 VIBE_KEY_MAP = {
     'x_vibration': 'x_vibe',

@@ -1,5 +1,5 @@
 from fastapi import APIRouter, Header, HTTPException
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from typing import Optional, Tuple
 from datetime import datetime
 import requests
@@ -7,7 +7,7 @@ import os
 import logging
 import time
 import json
-from thingsboard_auth import get_admin_jwt  # ✅ Use shared auth function
+from thingsboard_auth import get_admin_jwt 
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -39,20 +39,20 @@ TOLERANCE_MM = 10.0
 DOOR_OPEN_THRESHOLD_SEC = 15
 
 class TelemetryPayload(BaseModel):
-    deviceName: str
-    floor: str
-    timestamp: str
-    height: float
-    current_floor_index: Optional[int] = None
-    x_vibe: Optional[float] = None
-    y_vibe: Optional[float] = None
-    z_vibe: Optional[float] = None
-    x_jerk: Optional[float] = None
-    y_jerk: Optional[float] = None
-    z_jerk: Optional[float] = None
-    temperature: Optional[float] = None
-    humidity: Optional[float] = None
-    door_open: Optional[bool] = None
+    deviceName: str = Field(...)
+    floor: str = Field(...)
+    timestamp: str = Field(...)
+    height: float = Field(...)
+    current_floor_index: Optional[int] = Field(default=None)
+    x_vibe: Optional[float] = Field(default=None)
+    y_vibe: Optional[float] = Field(default=None)
+    z_vibe: Optional[float] = Field(default=None)
+    x_jerk: Optional[float] = Field(default=None)
+    y_jerk: Optional[float] = Field(default=None)
+    z_jerk: Optional[float] = Field(default=None)
+    temperature: Optional[float] = Field(default=None)
+    humidity: Optional[float] = Field(default=None)
+    door_open: Optional[bool] = Field(default=None)
 
 device_cache = {}
 bucket_counts = {}

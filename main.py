@@ -7,7 +7,10 @@ from starlette.requests import Request
 from report_logic import router as report_router, extract_jwt_user_info
 from alarm_logic import router as alarm_router
 from calculated_telemetry import router as calculated_router
-from thingsboard_auth import get_admin_jwt  # ✅ Import shared JWT helper
+from thingsboard_auth import get_admin_jwt
+from alarm_aggregation_scheduler import scheduler, stop_scheduler
+
+import threading
 import os
 import requests
 import logging
@@ -32,7 +35,7 @@ app.add_middleware(
 # === API Routers ===
 app.include_router(report_router)
 app.include_router(alarm_router)
-app.include_router(calculated_router)  # ✅ Mount new calculated telemetry endpoint
+app.include_router(calculated_router)
 
 # === Cloud ThingsBoard host ===
 TB_HOST = os.getenv("TB_BASE_URL", "https://thingsboard.cloud")
@@ -91,7 +94,6 @@ def download_csv(filename: str):
 def health_check():
     return {"status": "ok"}
 
-# === Admin JWT health check (optional) ===
 @app.get("/admin_jwt_status")
 def admin_jwt_status():
     token = get_admin_jwt()
@@ -99,3 +101,14 @@ def admin_jwt_status():
         return {"status": "success", "message": "Admin JWT retrieved successfully"}
     else:
         raise HTTPException(status_code=500, detail="Failed to retrieve Admin JWT")
+
+@app.on_event("startup")
+async def start_alarm_scheduler():
+    logger.info("[Scheduler] Starting background scheduler thread...")
+    thread = threading.Thread(target=scheduler, daemon=True)
+    thread.start()
+
+@app.on_event("shutdown")
+async def shutdown_alarm_scheduler():
+    logger.info("[Scheduler] Shutting down scheduler...")
+    stop_scheduler()

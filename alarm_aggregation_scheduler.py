@@ -2,19 +2,22 @@ import time
 import os
 import requests
 import logging
+import threading
 from thingsboard_auth import get_admin_jwt  # ✅ Shared JWT login
 
-# === Config ===
+
 THINGSBOARD_URL = os.getenv("TB_BASE_URL", "https://thingsboard.cloud")
 SCAN_INTERVAL = int(os.getenv("TB_SCHEDULER_INTERVAL", "30"))  # seconds
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("alarm_scheduler")
 
-# === Main Loop ===
+# === Control event for stopping the scheduler gracefully ===
+stop_event = threading.Event()
+
 def scheduler():
     logger.info("[Scheduler] Starting alarm aggregation loop...")
-    while True:
+    while not stop_event.is_set():
         try:
             jwt_token = get_admin_jwt()
             if not jwt_token:
@@ -33,7 +36,10 @@ def scheduler():
         except Exception as e:
             logger.error(f"[Scheduler] Error during aggregation: {e}")
 
-        time.sleep(SCAN_INTERVAL)
+        # Wait for interval or stop signal
+        stop_event.wait(SCAN_INTERVAL)
+
+    logger.info("[Scheduler] Stopped gracefully.")
 
 # === Fetch all assets ===
 def get_all_assets(headers):
@@ -95,6 +101,7 @@ def update_asset_alarm_count(asset_id, count, headers):
     except requests.RequestException as e:
         logger.warning(f"[Update] Failed to update asset {asset_id}: {e}")
 
-
-if __name__ == "__main__":
-    scheduler()
+# === Stop function to call on FastAPI shutdown ===
+def stop_scheduler():
+    logger.info("[Scheduler] Stop signal received.")
+    stop_event.set()

@@ -1,6 +1,8 @@
 import os
 import requests
 import logging
+from pydantic import BaseModel, Field
+
 
 logger = logging.getLogger("thingsboard_auth")
 
