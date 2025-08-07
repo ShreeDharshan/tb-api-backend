@@ -75,19 +75,18 @@ def get_related_entities(base_url, entity_id, headers):
 
 def get_active_alarm_count(base_url, device_id, headers):
     """
-    Gets the count of all active alarms for a specific device.
+    Gets the count of active alarms for a specific device.
     """
     try:
-        # Correct ThingsBoard API requires 'page' and 'pageSize'
         url = f"{base_url}/api/alarm/DEVICE/{device_id}?ps=100&page=0"
-
-        resp = requests.get(url, headers=headers, timeout=5)
+        resp = requests.get(url, headers=headers, timeout=10)
         resp.raise_for_status()
 
-        # FIX: Access the 'data' key correctly
-        alarms_data = resp.json()
-        alarms = alarms_data.get("data", [])
+    
+        alarm_page = resp.json()
+        alarms = alarm_page.get("data", [])
 
+        
         active_alarms_count = sum(
             1 for alarm in alarms if alarm.get("status") in ["ACTIVE_UNACK", "ACTIVE_ACK"]
         )
@@ -99,6 +98,7 @@ def get_active_alarm_count(base_url, device_id, headers):
     except Exception as e:
         logger.error(f"[Alarms] Unexpected error for device {device_id}: {e}")
         return 0
+
 
 
 
