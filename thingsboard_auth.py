@@ -1,10 +1,10 @@
 import os
-import logging
 import requests
+import logging
 
 logger = logging.getLogger("thingsboard_auth")
 
-# DEBUG: Print values at startup
+
 print("DEBUG: ACCOUNT1_ADMIN_USER =", os.environ.get("ACCOUNT1_ADMIN_USER"))
 print("DEBUG: ACCOUNT1_ADMIN_PASS =", os.environ.get("ACCOUNT1_ADMIN_PASS"))
 
@@ -19,3 +19,17 @@ def login_to_thingsboard(base_url: str, username: str, password: str):
     except requests.exceptions.HTTPError as e:
         logger.error(f"[Auth] Failed to retrieve JWT: {e}")
         return None
+
+
+def get_admin_jwt(account_id: str, base_url: str) -> str | None:
+    """
+    Shared function used by multiple files to get JWT token
+    """
+    username = os.getenv(f"{account_id.upper()}_ADMIN_USER")
+    password = os.getenv(f"{account_id.upper()}_ADMIN_PASS")
+
+    if not username or not password:
+        logger.warning("[Auth] Missing admin credentials in environment variables.")
+        return None
+
+    return login_to_thingsboard(base_url, username, password)
