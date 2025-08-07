@@ -5,6 +5,7 @@ import logging
 import threading
 from thingsboard_auth import get_admin_jwt
 from config import TB_ACCOUNTS
+from datetime import datetime, timedelta
 
 SCAN_INTERVAL = int(os.getenv("TB_SCHEDULER_INTERVAL", "30"))  # seconds
 
@@ -73,19 +74,26 @@ def get_related_entities(base_url, entity_id, headers):
         return []
 
 def get_active_alarm_count(base_url, device_id, headers):
-    url = f"{base_url}/api/alarm/QUERY"
-    payload = {
-        "pageSize": 100,
-        "page": 0,
-        "searchStatus": "ACTIVE",
-        "entityId": device_id,
-        "entityType": "DEVICE"
-    }
+    """
+    Gets the count of active alarms for a specific device within a specified time range.
+    """
     try:
-        resp = requests.post(url, headers={**headers, "Content-Type": "application/json"}, json=payload, timeout=5)
-        resp.raise_for_status()
-        data = resp.json()
-        return len(data.get("data", []))
+        # Calculate the time range (e.g., last 24 hours)
+        end_time = int(time.time() * 1000)  # Current time in milliseconds
+        start_time = end_time - 24 * 60 * 60 * 1000  # 24 hours ago
+
+        # Construct the URL for fetching alarms for a specific device
+        url = f"{base_url}/api/alarm/DEVICE/{device_id}?ps=100&startTs={start_time}&endTs={end_time}"
+
+        # Make the GET request to fetch alarms
+        resp = requests.get(url, headers=headers, timeout=5)
+        resp.raise_for_status()  # Raise HTTPError for bad responses (4xx or 5xx)
+
+        # Parse the JSON response and count the alarms with an "ACTIVE" status
+        alarms = resp.json()
+        active_alarms_count = sum(1 for alarm in alarms if alarm.get("status") in ["ACTIVE_UNACK", "ACTIVE_ACK"])
+
+        return active_alarms_count
     except requests.RequestException as e:
         logger.warning(f"[Alarms] Failed to get alarms for device {device_id}: {e}")
         return 0
