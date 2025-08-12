@@ -1,165 +1,233 @@
+# report_logic.py
 import os
 import io
+import re
+import time
 import json
+import uuid
 import logging
-from typing import List, Dict, Any
+from datetime import datetime, date
+from typing import List, Optional, Any
 
 import pandas as pd
-import requests
-from fastapi import APIRouter, Header, HTTPException, Form
-from fastapi.responses import JSONResponse
+from fastapi import APIRouter, Header, HTTPException
+from fastapi.responses import FileResponse
+from pydantic import BaseModel, Field, field_validator
 
-router = APIRouter()
 logger = logging.getLogger("report_logic")
+router = APIRouter()
 
-TB_HOST = os.getenv("TB_BASE_URL", "https://thingsboard.cloud")
+# Where to store generated files on Render (ephemeral but fine for downloads)
+REPORT_DIR = os.getenv("REPORT_DIR", "/tmp")
+os.makedirs(REPORT_DIR, exist_ok=True)
+
+# Telemetry keys we allow in reports (extend as needed)
+ALLOWED_TYPES = {
+    "height",
+    "direction",
+    "lift_status",
+    "current_floor_index",
+    "current_floor_label",
+    "x_vibe",
+    "y_vibe",
+    "z_vibe",
+    "x_jerk",
+    "y_jerk",
+    "z_jerk",
+}
+
+def _parse_any_date(val: Any) -> date:
+    """
+    Accept:
+      - 'YYYY-MM-DD'
+      - ISO datetime strings
+      - epoch millis or seconds (int/str)
+    Return Python date (no time component).
+    """
+    if val is None or val == "":
+        raise ValueError("missing date")
+
+    # int-like → epoch
+    if isinstance(val, (int, float)) or (isinstance(val, str) and val.isdigit()):
+        x = int(val)
+        # assume ms if it's too large
+        if x > 10_000_000_000:
+            dt = datetime.utcfromtimestamp(x / 1000.0)
+        else:
+            dt = datetime.utcfromtimestamp(x)
+        return dt.date()
+
+    if isinstance(val, date) and not isinstance(val, datetime):
+        return val
+
+    s = str(val).strip()
+
+    # YYYY-MM-DD
+    if re.match(r"^\d{4}-\d{2}-\d{2}$", s):
+        return datetime.strptime(s, "%Y-%m-%d").date()
+
+    # ISO datetime
+    try:
+        dt = datetime.fromisoformat(s.replace("Z", "+00:00"))
+        return dt.date()
+    except Exception as _:
+        pass
+
+    raise ValueError(f"unrecognized date format: {val!r}")
 
 
-def _bail_400(msg: str):
-    raise HTTPException(status_code=400, detail=msg)
+class ReportRequest(BaseModel):
+    # snake_case (preferred by your widget)
+    device_name: str = Field(..., alias="deviceName")
+    data_types: List[str] = Field(..., alias="dataTypes")
+    include_alarms: bool = Field(True, alias="includeAlarms")
+    start_date: Any = Field(..., alias="startDate")
+    end_date: Any = Field(..., alias="endDate")
+
+    # Pydantic config: accept both aliases and field names, ignore extras
+    model_config = {
+        "populate_by_name": True,
+        "extra": "ignore",
+        "str_min_length": 1,
+    }
+
+    # Coerce dates after parsing
+    @field_validator("start_date", "end_date", mode="before")
+    @classmethod
+    def _coerce_dates(cls, v):
+        return _parse_any_date(v)
+
+    @field_validator("data_types", mode="after")
+    @classmethod
+    def _filter_types(cls, v: List[str]):
+        if not v:
+            raise ValueError("data_types cannot be empty")
+        filtered = [t for t in v if t in ALLOWED_TYPES]
+        if not filtered:
+            raise ValueError("No valid data_types provided")
+        # Deduplicate while preserving order
+        seen = set()
+        result = []
+        for t in filtered:
+            if t not in seen:
+                seen.add(t)
+                result.append(t)
+        return result
+
+
+def _safe_filename(base: str) -> str:
+    s = re.sub(r"[^A-Za-z0-9._-]+", "_", base).strip("._-")
+    return s or "report"
+
+
+def _make_filename(device_name: str, start: date, end: date) -> str:
+    base = _safe_filename(f"{device_name}_{start.isoformat()}_{end.isoformat()}")
+    # Add short uuid to avoid collisions
+    return f"{base}_{uuid.uuid4().hex[:8]}.xlsx"
+
+
+def _fake_rows_for_now(req: ReportRequest) -> pd.DataFrame:
+    """
+    Placeholder data so downloads work end-to-end immediately.
+    Replace with real TB fetch + transform when ready.
+    """
+    rows = []
+    # One row per selected type at start/end to make a minimal but useful sheet
+    for t in req.data_types:
+        rows.append(
+            {
+                "timestamp": int(time.mktime(datetime.combine(req.start_date, datetime.min.time()).timetuple())) * 1000,
+                "device": req.device_name,
+                "key": t,
+                "value": None,
+                "note": "placeholder row – replace with real data",
+            }
+        )
+        rows.append(
+            {
+                "timestamp": int(time.mktime(datetime.combine(req.end_date, datetime.min.time()).timetuple())) * 1000,
+                "device": req.device_name,
+                "key": t,
+                "value": None,
+                "note": "placeholder row – replace with real data",
+            }
+        )
+    return pd.DataFrame(rows)
 
 
 @router.post("/generate_report/")
 def generate_report(
-    # form-data coming from the widget
-    startTs: str = Form(...),
-    endTs: str = Form(...),
-    deviceIds: str = Form(...),  # CSV of device IDs
-    fields: str = Form(...),     # JSON array in string form from the widget
-    groupBy: str = Form("device"),
-    agg: str = Form("avg"),
-    # headers
-    authorization: str = Header(...),
-    account_id: str | None = Header(default=None, alias="X-Account-ID"),
+    body: ReportRequest,
+    authorization: Optional[str] = Header(None, alias="Authorization"),
+    x_tb_account: Optional[str] = Header(None, alias="X-TB-Account"),
 ):
     """
-    Pull timeseries from ThingsBoard for the requested devices and fields,
-    write an .xlsx, and return { download_url, filename } JSON for the widget.
+    Generate an Excel report for the requested device and fields.
+    - Accepts both snake_case and camelCase body keys.
+    - Returns {filename, download_url} for the generated file.
     """
-    if not authorization.startswith("Bearer "):
-        _bail_400("Missing Bearer token")
-    jwt_token = authorization.split(" ", 1)[1]
+    # Basic auth presence check (widget already sends it)
+    if not authorization or not authorization.lower().startswith("bearer "):
+        raise HTTPException(status_code=401, detail="Missing or invalid Authorization header")
 
-    # account id is optional now; default if absent to avoid 422
-    if not account_id:
-        account_id = "account1"
+    # Validate dates
+    if body.end_date < body.start_date:
+        raise HTTPException(status_code=400, detail="end_date cannot be before start_date")
 
-    # parse and validate inputs
-    try:
-        start_ts = int(startTs)
-        end_ts = int(endTs)
-    except Exception:
-        _bail_400("startTs/endTs must be integers (ms)")
+    # You can pass x_tb_account to your internal fetch if needed
+    logger.info(
+        "[/generate_report] device=%s types=%s include_alarms=%s start=%s end=%s account=%s",
+        body.device_name,
+        body.data_types,
+        body.include_alarms,
+        body.start_date,
+        body.end_date,
+        x_tb_account,
+    )
 
-    if end_ts <= start_ts:
-        _bail_400("endTs must be greater than startTs")
+    # === TODO: Replace this block with real data pull from ThingsBoard ===
+    df = _fake_rows_for_now(body)
+    # ================================================================
 
-    try:
-        field_list: List[str] = json.loads(fields) if fields else []
-        if not isinstance(field_list, list):
-            _bail_400("fields must be a JSON array")
-        field_list = [f for f in field_list if isinstance(f, str) and f.strip()]
-    except Exception:
-        _bail_400("fields must be a JSON array")
-
-    dev_ids = [d.strip() for d in deviceIds.split(",") if d.strip()]
-    if not dev_ids:
-        _bail_400("deviceIds must be a non-empty CSV")
-
-    headers = {"X-Authorization": f"Bearer {jwt_token}"}
-
-    # interval for aggregation: choose a sane default (1 minute) if agg != NONE
-    # TB supports agg in [MIN, MAX, AVG, SUM, COUNT, NONE] (case-insensitive)
-    agg_map = {
-        "min": "MIN", "max": "MAX", "avg": "AVG", "sum": "SUM",
-        "count": "COUNT", "none": "NONE"
+    # Add a metadata sheet
+    meta = {
+        "device_name": body.device_name,
+        "data_types": ",".join(body.data_types),
+        "include_alarms": body.include_alarms,
+        "start_date": body.start_date.isoformat(),
+        "end_date": body.end_date.isoformat(),
+        "generated_at": datetime.utcnow().isoformat() + "Z",
+        "account": x_tb_account or "",
     }
-    agg_final = agg_map.get(str(agg).lower(), "AVG")
-    interval_ms = 60_000 if agg_final != "NONE" else 0
+    metadata_df = pd.DataFrame([meta])
 
-    # Pull telemetry
-    rows: List[Dict[str, Any]] = []
-    keys_param = ",".join(field_list) if field_list else ""
+    # Save to Excel
+    filename = _make_filename(body.device_name, body.start_date, body.end_date)
+    fpath = os.path.join(REPORT_DIR, filename)
+    with pd.ExcelWriter(fpath, engine="openpyxl") as writer:
+        df.to_excel(writer, index=False, sheet_name="data")
+        metadata_df.to_excel(writer, index=False, sheet_name="meta")
 
-    for dev_id in dev_ids:
-        # Device name lookup (so the spreadsheet is friendlier)
-        try:
-            name_resp = requests.get(f"{TB_HOST}/api/device/{dev_id}", headers=headers)
-            name_resp.raise_for_status()
-            device_name = name_resp.json().get("name", dev_id)
-        except Exception:
-            device_name = dev_id
-
-        # Timeseries fetch
-        params = {
-            "startTs": str(start_ts),
-            "endTs": str(end_ts),
-            "limit": "100000"
-        }
-        if keys_param:
-            params["keys"] = keys_param
-        if agg_final:
-            params["agg"] = agg_final
-        if interval_ms:
-            params["interval"] = str(interval_ms)
-
-        url = f"{TB_HOST}/api/plugins/telemetry/DEVICE/{dev_id}/values/timeseries"
-        try:
-            resp = requests.get(url, headers=headers, params=params)
-            resp.raise_for_status()
-            data = resp.json() or {}
-        except requests.HTTPError as e:
-            raise HTTPException(status_code=502, detail=f"TB fetch failed for {dev_id}: {e}")
-        except Exception as e:
-            raise HTTPException(status_code=500, detail=f"Error fetching data for {dev_id}: {e}")
-
-        # data is a dict like {"keyA":[{ts:...,value:"..."},...], "keyB":[...]}
-        for key, series in data.items():
-            if not isinstance(series, list):
-                continue
-            for point in series:
-                ts = point.get("ts")
-                value = point.get("value")
-                rows.append({
-                    "deviceId": dev_id,
-                    "deviceName": device_name,
-                    "key": key,
-                    "ts": ts,
-                    "value": value
-                })
-
-    # Build DataFrame and pivot/group depending on groupBy
-    if rows:
-        df = pd.DataFrame(rows)
-        # Cast numeric if possible
-        with pd.option_context("mode.chained_assignment", None):
-            df["value_num"] = pd.to_numeric(df["value"], errors="coerce")
-
-        # Optional: a simple pivot for (deviceName, ts) by key
-        try:
-            pivot = df.pivot_table(
-                index=["deviceName", "deviceId", "ts"],
-                columns="key",
-                values="value_num",
-                aggfunc="mean" if agg_final in ("NONE", "AVG") else "first",
-            ).reset_index()
-        except Exception:
-            # Fallback: just dump raw rows
-            pivot = df[["deviceName", "deviceId", "ts", "key", "value"]]
-    else:
-        pivot = pd.DataFrame(columns=["deviceName", "deviceId", "ts"] + field_list)
-
-    # Write Excel
-    filename = f"report_{account_id}_{start_ts}_{end_ts}.xlsx"
-    out_path = os.path.join(os.getcwd(), filename)
-    try:
-        with pd.ExcelWriter(out_path, engine="openpyxl") as writer:
-            pivot.to_excel(writer, sheet_name="Data", index=False)
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to write Excel: {e}")
-
-    # Respond for widget
-    return JSONResponse({
+    return {
+        "filename": filename,
         "download_url": f"/download/{filename}",
-        "filename": filename
-    })
+    }
+
+
+@router.get("/download/{filename}")
+def download_report(filename: str):
+    """
+    Serve a previously generated report from REPORT_DIR.
+    """
+    safe = _safe_filename(filename)
+    if safe != filename:
+        # simple protection against path tricks
+        raise HTTPException(status_code=400, detail="Invalid filename")
+    fpath = os.path.join(REPORT_DIR, filename)
+    if not os.path.exists(fpath):
+        raise HTTPException(status_code=404, detail="File not found")
+    return FileResponse(
+        fpath,
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        filename=filename,
+    )
