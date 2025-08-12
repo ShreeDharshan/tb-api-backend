@@ -14,7 +14,6 @@ logger = logging.getLogger(__name__)
 
 router = APIRouter()
 
-# === Load Multi-Account Configuration ===
 try:
     ACCOUNTS = json.loads(os.getenv("TB_ACCOUNTS", '{}'))
     if not isinstance(ACCOUNTS, dict):
