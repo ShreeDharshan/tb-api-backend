@@ -1,157 +1,165 @@
-from fastapi import APIRouter, Header, HTTPException, Request
-from fastapi.responses import JSONResponse, FileResponse
-from typing import Optional, Dict, Any
-import base64
-import json
 import os
+import io
+import json
 import logging
-import requests
-import pandas as pd
-from datetime import datetime, timezone, timedelta
+from typing import List, Dict, Any
 
-from thingsboard_auth import get_admin_jwt
-from config import TB_ACCOUNTS
+import pandas as pd
+import requests
+from fastapi import APIRouter, Header, HTTPException, Form
+from fastapi.responses import JSONResponse
 
 router = APIRouter()
 logger = logging.getLogger("report_logic")
 
 TB_HOST = os.getenv("TB_BASE_URL", "https://thingsboard.cloud")
 
-# -----------------------
-# Utilities
-# -----------------------
 
-def _b64url_decode(part: str) -> bytes:
-    rem = len(part) % 4
-    if rem:
-        part += "=" * (4 - rem)
-    return base64.urlsafe_b64decode(part.encode("utf-8"))
+def _bail_400(msg: str):
+    raise HTTPException(status_code=400, detail=msg)
 
-def _decode_jwt_payload(jwt_token: str) -> Dict[str, Any]:
-    try:
-        parts = jwt_token.split(".")
-        if len(parts) < 2:
-            return {}
-        payload_raw = _b64url_decode(parts[1])
-        return json.loads(payload_raw.decode("utf-8"))
-    except Exception as e:
-        logger.warning(f"[JWT] Failed to decode user payload: {e}")
-        return {}
-
-def _infer_account_id_from_email(email: str | None) -> Optional[str]:
-    """
-    Try to map user email/domain to an account key from TB_ACCOUNTS.
-    Assumes TB_ACCOUNTS keys are like 'ACCOUNT1', 'ACCOUNT2', etc.
-    You can extend mapping here if you maintain domain->account routing.
-    """
-    if not email:
-        return None
-    domain = email.split("@")[-1].lower()
-    # Example rule: first configured account is the default
-    if TB_ACCOUNTS:
-        return list(TB_ACCOUNTS.keys())[0]
-    return None
-
-def _pick_account_id(jwt_payload: Dict[str, Any], explicit_header: Optional[str]) -> str:
-    # 1) Explicit header wins
-    if explicit_header:
-        return explicit_header
-
-    # 2) Try infer from email/domain
-    email = jwt_payload.get("email")
-    inferred = _infer_account_id_from_email(email)
-    if inferred:
-        return inferred
-
-    # 3) Fallback to first configured account or ACCOUNT1
-    return list(TB_ACCOUNTS.keys())[0] if TB_ACCOUNTS else "ACCOUNT1"
-
-
-# -----------------------
-# Endpoints
-# -----------------------
 
 @router.post("/generate_report/")
 def generate_report(
-    request: Request,
+    # form-data coming from the widget
+    startTs: str = Form(...),
+    endTs: str = Form(...),
+    deviceIds: str = Form(...),  # CSV of device IDs
+    fields: str = Form(...),     # JSON array in string form from the widget
+    groupBy: str = Form("device"),
+    agg: str = Form("avg"),
+    # headers
     authorization: str = Header(...),
-    x_account_id: Optional[str] = Header(None),
+    account_id: str | None = Header(default=None, alias="X-Account-ID"),
 ):
     """
-    Generates the Excel report.
-    - `X-Account-ID` header is now OPTIONAL. If missing, we infer from JWT or fallback.
+    Pull timeseries from ThingsBoard for the requested devices and fields,
+    write an .xlsx, and return { download_url, filename } JSON for the widget.
     """
     if not authorization.startswith("Bearer "):
-        raise HTTPException(status_code=400, detail="Missing Bearer token")
+        _bail_400("Missing Bearer token")
     jwt_token = authorization.split(" ", 1)[1]
 
-    jwt_payload = _decode_jwt_payload(jwt_token)
-    account_id = _pick_account_id(jwt_payload, x_account_id)
+    # account id is optional now; default if absent to avoid 422
+    if not account_id:
+        account_id = "account1"
 
-    admin_jwt = get_admin_jwt(account_id=account_id, base_url=TB_HOST)
-    if not admin_jwt:
-        raise HTTPException(status_code=500, detail=f"Could not obtain admin JWT for account {account_id}")
-
-    # ---- Example: read query/body if any filters are posted (dates, device IDs, etc.)
+    # parse and validate inputs
     try:
-        body = request.json() if hasattr(request, "json") else None  # Starlette Request .json() is async, so:
+        start_ts = int(startTs)
+        end_ts = int(endTs)
     except Exception:
-        body = None
+        _bail_400("startTs/endTs must be integers (ms)")
 
-    # If you expect JSON body, parse it safely
+    if end_ts <= start_ts:
+        _bail_400("endTs must be greater than startTs")
+
     try:
-        body = None
-        if request.headers.get("content-type", "").startswith("application/json"):
-            body = json.loads((request._body or request.scope.get("_body", b"")).decode("utf-8")) if hasattr(request, "_body") else None
+        field_list: List[str] = json.loads(fields) if fields else []
+        if not isinstance(field_list, list):
+            _bail_400("fields must be a JSON array")
+        field_list = [f for f in field_list if isinstance(f, str) and f.strip()]
     except Exception:
-        body = None
+        _bail_400("fields must be a JSON array")
 
-    # ---- Fetch some data from TB (example: list devices & latest telemetry)
-    headers = {"X-Authorization": f"Bearer {admin_jwt}"}
+    dev_ids = [d.strip() for d in deviceIds.split(",") if d.strip()]
+    if not dev_ids:
+        _bail_400("deviceIds must be a non-empty CSV")
+
+    headers = {"X-Authorization": f"Bearer {jwt_token}"}
+
+    # interval for aggregation: choose a sane default (1 minute) if agg != NONE
+    # TB supports agg in [MIN, MAX, AVG, SUM, COUNT, NONE] (case-insensitive)
+    agg_map = {
+        "min": "MIN", "max": "MAX", "avg": "AVG", "sum": "SUM",
+        "count": "COUNT", "none": "NONE"
+    }
+    agg_final = agg_map.get(str(agg).lower(), "AVG")
+    interval_ms = 60_000 if agg_final != "NONE" else 0
+
+    # Pull telemetry
+    rows: List[Dict[str, Any]] = []
+    keys_param = ",".join(field_list) if field_list else ""
+
+    for dev_id in dev_ids:
+        # Device name lookup (so the spreadsheet is friendlier)
+        try:
+            name_resp = requests.get(f"{TB_HOST}/api/device/{dev_id}", headers=headers)
+            name_resp.raise_for_status()
+            device_name = name_resp.json().get("name", dev_id)
+        except Exception:
+            device_name = dev_id
+
+        # Timeseries fetch
+        params = {
+            "startTs": str(start_ts),
+            "endTs": str(end_ts),
+            "limit": "100000"
+        }
+        if keys_param:
+            params["keys"] = keys_param
+        if agg_final:
+            params["agg"] = agg_final
+        if interval_ms:
+            params["interval"] = str(interval_ms)
+
+        url = f"{TB_HOST}/api/plugins/telemetry/DEVICE/{dev_id}/values/timeseries"
+        try:
+            resp = requests.get(url, headers=headers, params=params)
+            resp.raise_for_status()
+            data = resp.json() or {}
+        except requests.HTTPError as e:
+            raise HTTPException(status_code=502, detail=f"TB fetch failed for {dev_id}: {e}")
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"Error fetching data for {dev_id}: {e}")
+
+        # data is a dict like {"keyA":[{ts:...,value:"..."},...], "keyB":[...]}
+        for key, series in data.items():
+            if not isinstance(series, list):
+                continue
+            for point in series:
+                ts = point.get("ts")
+                value = point.get("value")
+                rows.append({
+                    "deviceId": dev_id,
+                    "deviceName": device_name,
+                    "key": key,
+                    "ts": ts,
+                    "value": value
+                })
+
+    # Build DataFrame and pivot/group depending on groupBy
+    if rows:
+        df = pd.DataFrame(rows)
+        # Cast numeric if possible
+        with pd.option_context("mode.chained_assignment", None):
+            df["value_num"] = pd.to_numeric(df["value"], errors="coerce")
+
+        # Optional: a simple pivot for (deviceName, ts) by key
+        try:
+            pivot = df.pivot_table(
+                index=["deviceName", "deviceId", "ts"],
+                columns="key",
+                values="value_num",
+                aggfunc="mean" if agg_final in ("NONE", "AVG") else "first",
+            ).reset_index()
+        except Exception:
+            # Fallback: just dump raw rows
+            pivot = df[["deviceName", "deviceId", "ts", "key", "value"]]
+    else:
+        pivot = pd.DataFrame(columns=["deviceName", "deviceId", "ts"] + field_list)
+
+    # Write Excel
+    filename = f"report_{account_id}_{start_ts}_{end_ts}.xlsx"
+    out_path = os.path.join(os.getcwd(), filename)
     try:
-        # You can tailor the query per account/tenant/customer here
-        resp = requests.get(f"{TB_HOST}/api/tenant/devices?pageSize=1000&page=0", headers=headers, timeout=30)
-        resp.raise_for_status()
-        devices = resp.json().get("data", [])
-    except requests.RequestException as e:
-        logger.error(f"[generate_report] TB device fetch failed: {e}")
-        raise HTTPException(status_code=502, detail="ThingsBoard upstream error")
+        with pd.ExcelWriter(out_path, engine="openpyxl") as writer:
+            pivot.to_excel(writer, sheet_name="Data", index=False)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to write Excel: {e}")
 
-    # ---- Build a simple DataFrame as a placeholder
-    rows = []
-    for d in devices:
-        rows.append({
-            "Device Name": d.get("name"),
-            "Device ID": (d.get("id") or {}).get("id"),
-            "Type": d.get("type"),
-        })
-
-    df = pd.DataFrame(rows)
-    if df.empty:
-        df = pd.DataFrame([{"Device Name": "—", "Device ID": "—", "Type": "—"}])
-
-    # ---- Save to a dated Excel filename
-    now = datetime.now(timezone.utc).astimezone()
-    fname = f"report_{account_id}_{now.strftime('%Y%m%d_%H%M%S')}.xlsx"
-    df.to_excel(fname, index=False)
-
-    # ---- Return a JSON with link (and also support direct download endpoint)
+    # Respond for widget
     return JSONResponse({
-        "status": "ok",
-        "filename": fname,
-        "download_url": f"/download/{fname}",
-        "count": int(df.shape[0]),
-        "account_id": account_id
+        "download_url": f"/download/{filename}",
+        "filename": filename
     })
-
-
-@router.get("/download/{filename}")
-def download_file(filename: str):
-    file_path = os.path.join(os.getcwd(), filename)
-    if not os.path.exists(file_path):
-        raise HTTPException(status_code=404, detail="File not found")
-    return FileResponse(
-        path=file_path,
-        filename=filename,
-        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-    )
