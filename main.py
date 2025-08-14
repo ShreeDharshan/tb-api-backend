@@ -23,7 +23,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ===== Multi-account base URLs =====
+
 # Supports either:
 #  - TB_ACCOUNTS='{"account1":"https://thingsboard.cloud","account2":"https://thingsboard.cloud"}'
 #  - TB_BASE_URL='https://thingsboard.cloud' (fallback)
@@ -43,7 +43,7 @@ def load_tb_accounts() -> Dict[str, str]:
 TB_ACCOUNTS = load_tb_accounts()
 logger.info("[INIT] Loaded ThingsBoard accounts: %s", list(TB_ACCOUNTS.keys()))
 
-# ===== Optional: include project routers if present =====
+
 def try_include_router(module_name: str, attr: str = "router"):
     try:
         mod = __import__(module_name, fromlist=[attr])
@@ -58,7 +58,7 @@ try_include_router("report_logic")
 try_include_router("alarm_logic")
 try_include_router("calculated_telemetry")
 
-# ===== Optional: start background scheduler if available =====
+
 def start_alarm_scheduler():
     try:
         import alarm_aggregation_scheduler as sched
@@ -105,7 +105,7 @@ def page_all(fn, *args, page_size=100):
             break
     return results
 
-# ===== Endpoints =====
+
 @app.get("/")
 def root():
     raise HTTPException(status_code=404, detail="Nothing to see here.")

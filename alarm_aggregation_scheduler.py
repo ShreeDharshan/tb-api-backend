@@ -7,12 +7,11 @@ from thingsboard_auth import get_admin_jwt
 from config import TB_ACCOUNTS
 from datetime import datetime, timedelta
 
-SCAN_INTERVAL = int(os.getenv("TB_SCHEDULER_INTERVAL", "30"))  # seconds
+SCAN_INTERVAL = int(os.getenv("TB_SCHEDULER_INTERVAL", "30"))  
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("alarm_scheduler")
 
-# === Control event for stopping the scheduler gracefully ===
 stop_event = threading.Event()
 
 def scheduler():

@@ -5,12 +5,12 @@ from typing import Optional
 import time
 import os
 import json
-from thingsboard_auth import get_admin_jwt  #
+from thingsboard_auth import get_admin_jwt  
 
 router = APIRouter()
 logger = logging.getLogger("calculated_telemetry")
 
-# === Load Multi-Account Configuration ===
+
 try:
     ACCOUNTS = json.loads(os.getenv("TB_ACCOUNTS", '{}'))
     if not isinstance(ACCOUNTS, dict):
@@ -20,10 +20,10 @@ except json.JSONDecodeError:
 
 logger.info(f"[INIT] Loaded ThingsBoard accounts: {list(ACCOUNTS.keys())}")
 
-# === State storage (per account) ===
-device_state = {}  # { "account:device_token": {...} }
-floor_door_counts = {}  # { "account:device_token": {...} }
-floor_door_durations = {}  # { "account:device_token": {...} }
+
+device_state = {}  
+floor_door_counts = {}  
+floor_door_durations = {}  
 
 from pydantic import BaseModel, Field
 from typing import Optional
@@ -71,12 +71,12 @@ async def calculate_telemetry(
         floor_door_durations[device_key] = {}
 
     state = device_state[device_key]
-    home_floor = 1  # TODO: Fetch dynamically if required
+    home_floor = 1  # TODO: 
 
-    # Treat lift as idle if status is "Idle" OR door is open
+   
     is_idle = (payload.lift_status.lower() == "idle") or payload.door_open
 
-    # ----- Idle calculation -----
+ 
     if is_idle:
         if floor == home_floor:
             if state["last_idle_home_ts"] is None:
@@ -98,7 +98,7 @@ async def calculate_telemetry(
         state["last_idle_home_ts"] = None
         state["last_idle_outside_ts"] = None
 
-    # ----- Door tracking -----
+    
     if floor not in floor_door_counts[device_key]:
         floor_door_counts[device_key][floor] = 0
     if floor not in floor_door_durations[device_key]:

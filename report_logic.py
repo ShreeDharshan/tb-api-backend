@@ -221,7 +221,7 @@ def download_report(filename: str):
     """
     safe = _safe_filename(filename)
     if safe != filename:
-        # simple protection against path tricks
+        
         raise HTTPException(status_code=400, detail="Invalid filename")
     fpath = os.path.join(REPORT_DIR, filename)
     if not os.path.exists(fpath):
