@@ -9,48 +9,83 @@ from typing import Any, Dict, Optional, Tuple, List
 
 import requests
 from fastapi import APIRouter, Header, HTTPException
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
-# Common pack parser helpers
+# Common helpers (already in your repo)
 from pack_format import (
     parse_pack_raw,
     ts_seconds,
+    ts_millis,
     door_to_bit,
     get_float,
 )
 
-# Your existing admin JWT helper (signature: get_admin_jwt(account_id: str, host: str) -> str)
-from thingsboard_auth import get_admin_jwt
+from thingsboard_auth import get_admin_jwt  # signature: get_admin_jwt(account_id: str, host: str) -> str
 
-# ------------------------------------------------------------------------------
-# Setup
-# ------------------------------------------------------------------------------
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("calculated_telemetry")
 
 router = APIRouter()
 
-# Multi-account TB endpoints via env TB_ACCOUNTS='{"acct":"https://thingsboard.cloud", ...}'
-try:
-    ACCOUNTS = json.loads(os.getenv("TB_ACCOUNTS", "{}"))
-    if not isinstance(ACCOUNTS, dict):
-        raise ValueError("TB_ACCOUNTS must be a JSON object")
-except json.JSONDecodeError:
-    raise RuntimeError("Invalid JSON format for TB_ACCOUNTS environment variable")
+# ------------------------------------------------------------------------------
+# Multi-account TB endpoints
+# ------------------------------------------------------------------------------
+def _load_tb_accounts() -> Dict[str, str]:
+    raw = os.getenv("TB_ACCOUNTS", "").strip()
+    if raw:
+        try:
+            data = json.loads(raw)
+            if isinstance(data, dict) and data:
+                return {str(k): str(v) for k, v in data.items()}
+        except Exception as e:
+            logger.warning("[TB_ACCOUNTS] parse failed: %s", e)
+    base = os.getenv("TB_BASE_URL", "https://thingsboard.cloud").strip()
+    return {"default": base}
 
-logger.info(f"[INIT] Loaded ThingsBoard accounts: {list(ACCOUNTS.keys())}")
+ACCOUNTS = _load_tb_accounts()
+logger.info("[INIT] Loaded ThingsBoard accounts: %s", list(ACCOUNTS.keys()))
+
+def _resolve_account(x_account_id: Optional[str]) -> str:
+    if x_account_id:
+        if x_account_id in ACCOUNTS:
+            return x_account_id
+        if x_account_id.lower() in ACCOUNTS:
+            return x_account_id.lower()
+    return next(iter(ACCOUNTS.keys()))
 
 # ------------------------------------------------------------------------------
-# Models
+# Input model (tolerant)
 # ------------------------------------------------------------------------------
 class CalcIn(BaseModel):
     deviceName: str = Field(...)
     device_token: Optional[str] = Field(default=None)
-    pack_raw: str = Field(..., description="k=v|k=v packed raw string")
+
+    # prefer 'pack_raw', but accept common alternates
+    pack_raw: Optional[str] = Field(default=None)
+    raw: Optional[str] = Field(default=None)
+    pack: Optional[str] = Field(default=None)
+    payload: Optional[Dict[str, Any]] = Field(default=None)
+
     ts: Optional[int] = Field(default=None, description="epoch ms (optional; else parsed ts or now)")
 
+    @model_validator(mode="after")
+    def unify_pack(self):
+        # Normalize to pack_raw
+        if not self.pack_raw:
+            if self.raw:
+                self.pack_raw = self.raw
+            elif self.pack:
+                self.pack_raw = self.pack
+            elif isinstance(self.payload, dict):
+                self.pack_raw = (
+                    self.payload.get("pack_raw")
+                    or self.payload.get("raw")
+                    or self.payload.get("pack")
+                )
+        return self
+
 # ------------------------------------------------------------------------------
-# Caches / state (in-memory; switch to Redis/DB if you need durability)
+# Caches / state
 # ------------------------------------------------------------------------------
 _device_id_cache: Dict[str, str] = {}             # f"{account}:{device}" -> deviceId
 _floor_meta_cache: Dict[str, Dict[str, Any]] = {} # f"{account}:{device}" -> {boundaries, labels, home_floor, ts}
@@ -182,9 +217,6 @@ def _derive_motion(device: str, h: float) -> Tuple[str, str, float]:
     return dirc, status, vel
 
 def _build_pack_calc(ts_sec: int, h: float, fi: int, fl: str, dirc: str, status: str, door_bit: Optional[int]) -> str:
-    """
-    Compact calculated string saved per second in TB.
-    """
     parts = []
     def add(k, v): parts.append(f"{k}={'' if v is None else v}")
     add("v", 1)
@@ -197,38 +229,77 @@ def _build_pack_calc(ts_sec: int, h: float, fi: int, fl: str, dirc: str, status:
     add("door", door_bit)
     return "|".join(parts)
 
+# Which raw fields to preserve (fallbacks included)
+_RAW_EXPORT_MAP: List[Tuple[str, Optional[str]]] = [
+    ("laser_val", None),
+    ("height_raw", None),
+    ("x_vibe", "accel_x_val"),
+    ("y_vibe", "accel_y_val"),
+    ("z_vibe", "accel_z_val"),
+    ("x_jerk", "gyro_x_val"),
+    ("y_jerk", "gyro_y_val"),
+    ("z_jerk", "gyro_z_val"),
+    ("temperature", "mpu_temp_val"),
+    ("humidity", "humidity_val"),
+    ("mic", "mic_val"),
+    ("door_val", None),
+]
+
+def _build_pack_out(pack_calc: str, parsed_raw: Dict[str, Any]) -> str:
+    """
+    Merge calculated string with selected raw fields into a single packed string.
+    This is the one we recommend saving as the single-per-second datapoint.
+    """
+    parts = [pack_calc]  # start with calc
+    for key, fallback in _RAW_EXPORT_MAP:
+        val = parsed_raw.get(key)
+        if val is None and fallback:
+            val = parsed_raw.get(fallback)
+        # normalize booleans/None
+        if isinstance(val, bool):
+            val = "true" if val else "false"
+        if val is None:
+            continue
+        parts.append(f"{key}={val}")
+    return "|".join(parts)
+
 # ------------------------------------------------------------------------------
 # Endpoint
 # ------------------------------------------------------------------------------
 @router.post("/calculated-telemetry/")
 def calculated_telemetry(
     payload: CalcIn,
-    x_account_id: str = Header(...),
-    authorization: Optional[str] = Header(None),  # not used; we use admin JWT for TB reads
+    x_account_id: Optional[str] = Header(None, alias="X-Account-Id"),
+    authorization: Optional[str] = Header(None),  # not used; admin JWT is used for TB reads
 ):
     """
-    Rule Chain posts {deviceName, pack_raw, ts?}.
+    Rule Chain posts {deviceName, pack_raw (or raw/pack/payload), ts?}.
     We compute floor/direction/status/door and return:
-        {"pack_calc": "v=1|ts=...|h=...|fi=...|fl=...|dir=U|st=M|door=1", "ts": <ms>}
+        {
+          "pack_calc": "v=1|ts=...|h=...|fi=...|fl=...|dir=U|st=M|door=1",
+          "pack_out":  "pack_calc|<subset of raw k=v pairs>",
+          "pack_raw":  "<echo of inbound raw>",
+          "ts": <ms>
+        }
     """
-    if x_account_id not in ACCOUNTS:
-        raise HTTPException(status_code=400, detail="Invalid account ID")
+    account = _resolve_account(x_account_id)
+
+    if not payload.pack_raw:
+        logger.error("[/calculated-telemetry] Missing 'pack_raw' (or 'raw'/'pack')")
+        raise HTTPException(status_code=400, detail="Missing 'pack_raw'")
 
     device = payload.deviceName
     parsed = parse_pack_raw(payload.pack_raw)
 
-    # Timestamp:
-    #  - prefer payload.ts (ms)
-    #  - else parsed ts (seconds) -> convert to ms
-    #  - else now
+    # Timestamp (ms): prefer payload.ts, else parsed ts (seconds), else now
     ts_ms = payload.ts
     if ts_ms is None:
         sec = ts_seconds(parsed)
-        ts_ms = int(sec * 1000) if isinstance(sec, int) else int(time.time() * 1000)
+        ts_ms = int(sec * 1000) if isinstance(sec, int) else (ts_millis(parsed) or int(time.time() * 1000))
     ts_sec = int(ts_ms // 1000)
 
     # Floor metadata (cached)
-    boundaries, labels, home_floor = _get_floor_meta(device, x_account_id)
+    boundaries, labels, _home_floor = _get_floor_meta(device, account)
 
     # Core deriveds
     h = _compute_height(parsed, boundaries)
@@ -238,6 +309,11 @@ def calculated_telemetry(
     door_bit = door_to_bit(parsed.get("door_val"))
 
     pack_calc = _build_pack_calc(ts_sec, h, fi, fl, dirc, status, door_bit)
+    pack_out = _build_pack_out(pack_calc, parsed)
 
-    # Return both pack_calc and ts (ms) so Save TS can use device time if you set useServerTs=false
-    return {"pack_calc": pack_calc, "ts": ts_ms}
+    return {
+        "pack_calc": pack_calc,
+        "pack_out": pack_out,     # <= SAVE THIS as the single key if you want calc+raw together
+        "pack_raw": payload.pack_raw,
+        "ts": ts_ms
+    }
