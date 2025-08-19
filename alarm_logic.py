@@ -140,7 +140,7 @@ def check_bucket_and_trigger(device: str, key: str, value: float, height: float,
     matched = False
 
     for b in buckets:
-        if abs(b["center"] - height) <= 50:
+        if abs(b["center"] - height) <= 2000:
             b["count"] += 1
             matched = True
             if b["count"] >= 3:
@@ -148,7 +148,7 @@ def check_bucket_and_trigger(device: str, key: str, value: float, height: float,
                     "value": value,
                     "threshold": THRESHOLDS[key],
                     "floor": floor,
-                    "height_zone": f"{b['center']-50:.1f} to {b['center']+50:.1f}"
+                    "height_zone": f"{b['center']-2000:.1f} to {b['center']+2000:.1f}"
                 }, account_id)
                 buckets.remove(b)
             break
