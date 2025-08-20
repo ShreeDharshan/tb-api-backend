@@ -82,6 +82,10 @@ try_include_router("calculated_telemetry")
 
 # --- Background scheduler (optional) -----------------------------------------
 def start_alarm_scheduler():
+    """
+    Start the env-driven scheduler thread.
+    Expects alarm_aggregation_scheduler.scheduler() to be a blocking loop.
+    """
     try:
         import alarm_aggregation_scheduler as sched
         logger.info("[Scheduler] Starting background scheduler thread...")
@@ -108,7 +112,11 @@ def tb_get(base: str, path: str, jwt: str, params: Optional[dict] = None):
     r = requests.get(url, headers=headers, params=params or {}, timeout=20)
     if r.status_code >= 400:
         raise HTTPException(status_code=r.status_code, detail=f"TB GET {path} failed: {r.text}")
-    return r.json()
+    # some TB endpoints return empty bodies; normalize to {}
+    try:
+        return r.json()
+    except Exception:
+        return {}
 
 def page_all(fn, *args, page_size=100):
     results = []
@@ -195,6 +203,22 @@ def get_my_devices(
         devices = normalize_devices(all_devices)
 
     return devices
+
+# --- Optional ops helpers ----------------------------------------------------
+@app.post("/daily_stats/run_now")
+def daily_stats_run_now():
+    """
+    Manually trigger lift-traffic counters over the configured lookback window.
+    Useful during testing or when called by a TB Scheduler node.
+    """
+    try:
+        # lazy import to avoid hard dependency if you don't want this feature
+        from daily_counters import run_once_over_window
+        result = run_once_over_window()
+        return {"ok": True, **result}
+    except Exception as e:
+        logger.exception("daily_stats_run_now error: %s", e)
+        raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/healthz")
 def healthz():
