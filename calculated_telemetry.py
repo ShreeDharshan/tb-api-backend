@@ -1,4 +1,3 @@
-# calculated_telemetry.py
 import os
 import json
 import time
@@ -10,7 +9,7 @@ from fastapi import APIRouter, Header, HTTPException, Request
 
 from thingsboard_auth import get_admin_jwt
 
-# Optional live counters (for door/idle aggregation without DB reads)
+# Optional live counters (door/idle aggregation without DB reads)
 try:
     from live_counters import process_pack_out_sample
 except Exception:
@@ -46,15 +45,21 @@ def _load_tb_accounts() -> Dict[str, str]:
 TB_ACCOUNTS = _load_tb_accounts()
 logger.info("[INIT] Loaded ThingsBoard accounts: %s", list(TB_ACCOUNTS.keys()))
 
-def _choose_base_url(x_tb_account: Optional[str], body_account: Optional[str]) -> str:
-    key = (x_tb_account or body_account or "").strip()
-    if key:
-        if key in TB_ACCOUNTS:
-            return TB_ACCOUNTS[key]
-        lk = key.lower()
+def _choose_base_url(*candidates: Optional[str]) -> str:
+    """
+    Choose base URL from multiple possible account id inputs (header or body).
+    """
+    for key in candidates:
+        if not key:
+            continue
+        k = key.strip()
+        if not k:
+            continue
+        if k in TB_ACCOUNTS:
+            return TB_ACCOUNTS[k]
+        lk = k.lower()
         if lk in TB_ACCOUNTS:
             return TB_ACCOUNTS[lk]
-    # default to the first/only configured URL
     return next(iter(TB_ACCOUNTS.values()))
 
 # ---------------------------------------------------------------------------
@@ -77,7 +82,6 @@ def tb_find_device_by_name(base: str, jwt: str, device_name: str) -> Dict[str, A
     if r.status_code == 200:
         try:
             d = r.json() or {}
-            # TB may return actual object or 404-like in body; be defensive
             if isinstance(d, dict) and d.get("id"):
                 return d
         except Exception:
@@ -85,14 +89,12 @@ def tb_find_device_by_name(base: str, jwt: str, device_name: str) -> Dict[str, A
         return {}
     if r.status_code == 404:
         return {}
-    # If user token without tenant rights, you can use /api/user/devices paging instead.
-    # For this endpoint we expect admin JWT; raise otherwise.
     r.raise_for_status()
     return {}
 
 def tb_save_ts(base: str, jwt: str, device_id: str, values: Dict[str, Any], ts_ms: Optional[int] = None) -> None:
     """
-    Write telemetry synchronously (optional; not used for counters since we flush them later).
+    Write telemetry synchronously (not used here; counters flush separately).
     """
     url = f"{base.rstrip('/')}/api/plugins/telemetry/DEVICE/{device_id}/timeseries/ANY"
     body = {"ts": ts_ms or int(time.time() * 1000), "values": {}}
@@ -109,56 +111,54 @@ def tb_save_ts(base: str, jwt: str, device_id: str, values: Dict[str, Any], ts_m
 # Parsing helpers
 # ---------------------------------------------------------------------------
 
-def _extract_pack_out_and_ts(payload: Dict[str, Any]) -> Tuple[Optional[str], int]:
+def _extract_pack_out_or_raw_and_ts(payload: Dict[str, Any]) -> Tuple[Optional[str], Optional[str], int]:
     """
-    Try to find a pack_out (or pack_raw) string and a timestamp (ms) in flexible payloads.
+    Try to find pack_out or pack_raw and a timestamp (ms) in flexible payloads.
+    Returns (pack_out, pack_raw, ts_ms). If only pack_raw exists, we will treat it as pack_out.
     """
     ts_ms = int(payload.get("ts") or payload.get("timestamp") or int(time.time() * 1000))
     pack_out = None
+    pack_raw = None
+
+    def _pick(d: Dict[str, Any]) -> Tuple[Optional[str], Optional[str]]:
+        po = d.get("pack_out")
+        pr = d.get("pack_raw")
+        return (po if isinstance(po, str) else None,
+                pr if isinstance(pr, str) else None)
 
     # direct
-    if isinstance(payload.get("pack_out"), str):
-        pack_out = payload["pack_out"]
-
-    # NEW: accept pack_raw as alias
-    if pack_out is None and isinstance(payload.get("pack_raw"), str):
-        pack_out = payload["pack_raw"]
+    pack_out, pack_raw = _pick(payload)
 
     # nested "telemetry"
-    if pack_out is None:
+    if not pack_out and not pack_raw:
         telem = payload.get("telemetry")
         if isinstance(telem, dict):
-            if isinstance(telem.get("pack_out"), str):
-                pack_out = telem["pack_out"]
-            elif isinstance(telem.get("pack_raw"), str):
-                pack_out = telem["pack_raw"]
-            elif isinstance(telem.get("pack_out"), (dict, list)):
+            pack_out, pack_raw = _pick(telem)
+            if not pack_out and isinstance(telem.get("pack_out"), (dict, list)):
                 pack_out = json.dumps(telem["pack_out"], separators=(",", ":"))
 
     # nested "data"
-    if pack_out is None:
+    if not pack_out and not pack_raw:
         data = payload.get("data")
         if isinstance(data, dict):
-            if isinstance(data.get("pack_out"), str):
-                pack_out = data["pack_out"]
-            elif isinstance(data.get("pack_raw"), str):
-                pack_out = data["pack_raw"]
-            elif isinstance(data.get("pack_out"), (dict, list)):
+            pack_out, pack_raw = _pick(data)
+            if not pack_out and isinstance(data.get("pack_out"), (dict, list)):
                 pack_out = json.dumps(data["pack_out"], separators=(",", ":"))
 
     # fallback: accept already-stringified 'payload'
-    if pack_out is None and isinstance(payload.get("payload"), str) and "pack_out" in payload["payload"]:
+    if not pack_out and not pack_raw and isinstance(payload.get("payload"), str):
         try:
             j = json.loads(payload["payload"])
             if isinstance(j, dict):
-                if isinstance(j.get("pack_out"), str):
-                    pack_out = j["pack_out"]
-                elif isinstance(j.get("pack_raw"), str):
-                    pack_out = j["pack_raw"]
+                po, pr = _pick(j)
+                if po:
+                    pack_out = po
+                elif pr:
+                    pack_raw = pr
         except Exception:
             pass
 
-    return pack_out, ts_ms
+    return pack_out, pack_raw, ts_ms
 
 # ---------------------------------------------------------------------------
 # Endpoint
@@ -169,57 +169,59 @@ async def calculated_telemetry(
     request: Request,
     authorization: Optional[str] = Header(None, alias="Authorization"),
     x_tb_account: Optional[str] = Header(None, alias="X-TB-Account"),
+    x_account_id: Optional[str] = Header(None, alias="X-Account-ID"),
 ):
     """
-    Accepts a flexible JSON payload that includes:
+    Accepts:
       - deviceName (preferred) OR deviceId
-      - account (optional; else from X-TB-Account; else default from env)
-      - pack_out string (JSON or k=v|k=v), and optional ts (ms)
+      - (optional) account header: X-TB-Account or X-Account-ID, or 'account' in body
+      - pack_out string (JSON or k=v|k=v) OR pack_raw string; ts optional (ms)
     Behavior:
-      - Resolves the device via admin JWT (tenant scope).
-      - Feeds the sample to live counters (if enabled) for door/idle aggregation.
-      - Optionally can emit other derived telemetry (currently not writing anything here).
-    Returns 200 with a small status body.
+      - Resolves device via admin JWT.
+      - Ensures we have a 'pack_out' string (if only pack_raw present, we use that).
+      - Feeds the sample to live counters (if module is available).
+      - Returns a body that includes 'pack_out' so the rule-chain can save it.
     """
     try:
         body: Dict[str, Any] = await request.json()
     except Exception:
         raise HTTPException(status_code=400, detail="Invalid JSON body")
 
-    # Resolve TB base URL
-    base = _choose_base_url(x_tb_account, body.get("account"))
+    base = _choose_base_url(x_tb_account, x_account_id, body.get("account"))
     jwt = get_admin_jwt()
 
     # Resolve device
     device_id = None
     device_name = None
 
-    # If deviceId is provided directly, prefer it
+    # Prefer provided deviceId
     raw_id = body.get("deviceId") or body.get("device_id")
     if isinstance(raw_id, str) and len(raw_id) >= 10:
         device_id = raw_id
 
-    # Otherwise use deviceName
+    # Otherwise resolve by name
     device_name = body.get("deviceName") or body.get("device_name") or body.get("name")
     if not device_id:
         if not device_name:
             raise HTTPException(status_code=400, detail="deviceName or deviceId is required")
         dev = tb_find_device_by_name(base, jwt, device_name)
         status = 200 if dev else 404
-        logger.info("[DEVICE] lookup %s@%s -> %s", device_name, _account_label(x_tb_account, body.get("account")), status)
+        logger.info("[DEVICE] lookup %s@%s -> %s", device_name, _account_label(x_tb_account, x_account_id, body.get("account")), status)
         if not dev:
             raise HTTPException(status_code=404, detail=f"Device '{device_name}' not found in account")
         device_id = (dev.get("id") or {}).get("id")
-        # Normalize device_name from TB, in case caller used a nickname
         device_name = dev.get("name") or device_name
     else:
-        # If we have an ID but not a name, keep the provided name if present
         logger.info("[DEVICE] using provided id %s", device_id)
 
-    # Extract pack_out + timestamp (ms)
-    pack_out_str, ts_ms = _extract_pack_out_and_ts(body)
+    # Extract pack_out/pack_raw + timestamp (ms)
+    pack_out_str, pack_raw_str, ts_ms = _extract_pack_out_or_raw_and_ts(body)
 
-    # Feed live counters (if module is available and we have pack_out)
+    # If pack_out missing but pack_raw present, treat raw as out (k=v|... works with counters)
+    if not isinstance(pack_out_str, str) and isinstance(pack_raw_str, str):
+        pack_out_str = pack_raw_str
+
+    # Feed live counters (if available and we have a string)
     fed = False
     if process_pack_out_sample and isinstance(pack_out_str, str):
         try:
@@ -228,23 +230,29 @@ async def calculated_telemetry(
         except Exception as e:
             logger.exception("[LIVE_COUNTERS] process error for %s (%s): %s", device_name, device_id, e)
 
-    # OPTIONAL: write any immediate derived telemetry here if you want (skipped by design)
-    # tb_save_ts(base, jwt, device_id, {"some_calculated_key": ... }, ts_ms)
-
-    return {
+    # Respond with pack_out so rule chain can store it
+    resp = {
         "ok": True,
-        "account": _account_label(x_tb_account, body.get("account")),
+        "account": _account_label(x_tb_account, x_account_id, body.get("account")),
         "deviceId": device_id,
         "deviceName": device_name,
         "fed_counters": fed,
         "ts_ms": ts_ms,
-        "has_pack_out": isinstance(pack_out_str, str)
+        "has_pack_out": isinstance(pack_out_str, str),
     }
+    if isinstance(pack_out_str, str):
+        resp["pack_out"] = pack_out_str
+
+    return resp
 
 # ---------------------------------------------------------------------------
 # Utils
 # ---------------------------------------------------------------------------
 
-def _account_label(hdr: Optional[str], body_val: Optional[str]) -> str:
-    v = (hdr or body_val or "default").strip()
-    return v
+def _account_label(h1: Optional[str], h2: Optional[str], body_val: Optional[str]) -> str:
+    for v in (h1, h2, body_val):
+        if v is not None:
+            vv = str(v).strip()
+            if vv:
+                return vv
+    return "default"
