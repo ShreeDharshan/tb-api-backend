@@ -1,16 +1,10 @@
 # alarm_aggregation_scheduler.py
 """
-Single lightweight scheduler that can drive:
-  1) Alarm aggregation/polling loop (interval: TB_SCHEDULER_INTERVAL)
-  2) Lift-traffic stats writer (interval: TB_DAILY_STATS_INTERVAL_SEC, lookback: TB_DAILY_STATS_LOOKBACK_SEC)
+Scheduler driving:
+  1) Alarm loop (TB_SCHEDULER_INTERVAL)
+  2) Live-counters daily flush loop (LC_TB_FLUSH_INTERVAL_SEC)
 
-Both intervals are ENV-configurable so you can test rapidly now and switch to end-of-day later.
-
-This module supports TWO invocation styles:
-  A) Old style (blocking): threading.Thread(target=alarm_aggregation_scheduler.scheduler, daemon=True).start()
-  B) New style (managed):  alarm_aggregation_scheduler.start_scheduler(); ... stop_scheduler()
-
-Only one loop will run at a time; double-starts are ignored.
+Set LC_TZ to control which "date" gets flushed; with Asia/Kolkata you'll get local-day buckets.
 """
 
 import os
@@ -18,50 +12,62 @@ import time
 import threading
 import logging
 
-# Local import in tick to keep import-time light if daily counters are disabled in some envs
-def _run_daily_counters_once():
-    from daily_counters import run_once_over_window
-    return run_once_over_window()
-
 logger = logging.getLogger("alarm_scheduler")
 logging.basicConfig(level=logging.INFO)
 
-# ====== ENV knobs ======
-ALARM_INTERVAL_SEC = int(os.getenv("TB_SCHEDULER_INTERVAL", "30"))            # existing poller interval
-DAILY_INTERVAL_SEC = int(os.getenv("TB_DAILY_STATS_INTERVAL_SEC", "86400"))   # e.g. 900 for 15-min tests
-# DAILY_STATS_LOOKBACK_SEC is read inside daily_counters.py
+# --- Intervals ---
+ALARM_INTERVAL_SEC = int(os.getenv("TB_SCHEDULER_INTERVAL", "30"))
+FLUSH_INTERVAL_SEC = int(os.getenv("LC_TB_FLUSH_INTERVAL_SEC", "86400"))  # end-of-day in prod
+RUN_FLUSH_ON_START = os.getenv("LC_TB_FLUSH_ON_START", "false").lower() in ("1", "true", "yes")
 
-# ====== State ======
+# --- State ---
 _stop_event = threading.Event()
 _thread = None
 _loop_started = False
 _state_lock = threading.Lock()
 
 def _alarm_tick():
-    """
-    Placeholder for your alarm aggregation work.
-    Right now alarms are API-driven from /check_alarm, so this is a hook if you later aggregate/clear periodically.
-    """
-    logger.debug("[AlarmLoop] tick (interval=%ss)", ALARM_INTERVAL_SEC)
-    # no-op for now
+    logger.info("[AlarmLoop] tick (interval=%ss)", ALARM_INTERVAL_SEC)
+    # no-op (your /check_alarm handles real alarm evaluation)
 
-def _daily_stats_tick():
-    """
-    Run the per-device lift-traffic computation over the configured lookback window and write to telemetry.
-    """
-    logger.info("[DailyLoop] Computing & writing lift-traffic stats (interval=%ss)", DAILY_INTERVAL_SEC)
-    _run_daily_counters_once()
+def _current_local_date(ts_ms: int) -> str:
+    tz = os.getenv("LC_TZ", "UTC").strip()
+    if tz.startswith(("+", "-")) and len(tz) >= 3 and ":" in tz:
+        sign = 1 if tz[0] == "+" else -1
+        hh, mm = tz[1:].split(":", 1)
+        offset_sec = sign * (int(hh) * 3600 + int(mm) * 60)
+        sec = (ts_ms // 1000) + offset_sec
+        return time.strftime("%Y-%m-%d", time.gmtime(sec))
+    return time.strftime("%Y-%m-%d", time.gmtime(ts_ms / 1000.0))
+
+def _flush_tick():
+    from live_counters import flush_day_to_tb
+    # Flush yesterday if you want to ensure day is complete; here we flush "today so far" (easier for tests)
+    now_ms = int(time.time() * 1000)
+    date_str = _current_local_date(now_ms)
+    logger.info("[LiveCounters] Flushing counters for %s", date_str)
+    flushed = flush_day_to_tb(date_str)
+    logger.info("[LiveCounters] Flush complete: %d device(s)", flushed)
 
 def _run_loop():
-    logger.info("[Scheduler] Starting; alarm every %ss, daily-stats every %ss",
-                ALARM_INTERVAL_SEC, DAILY_INTERVAL_SEC)
-    next_alarm = time.time() + ALARM_INTERVAL_SEC
-    next_daily = time.time() + DAILY_INTERVAL_SEC
+    logger.info("[Scheduler] Starting; alarm every %ss, flush every %ss; flush_on_start=%s",
+                ALARM_INTERVAL_SEC, FLUSH_INTERVAL_SEC, RUN_FLUSH_ON_START)
+
+    now = time.time()
+    next_alarm = now + ALARM_INTERVAL_SEC
+    next_flush = now + FLUSH_INTERVAL_SEC
+
+    if RUN_FLUSH_ON_START:
+        time.sleep(3)
+        try:
+            _flush_tick()
+        except Exception as e:
+            logger.exception("[LiveCounters] flush on start error: %s", e)
+        next_flush = time.time() + FLUSH_INTERVAL_SEC
 
     while not _stop_event.is_set():
         now = time.time()
 
-        # alarm loop
         if now >= next_alarm:
             try:
                 _alarm_tick()
@@ -70,36 +76,27 @@ def _run_loop():
             finally:
                 next_alarm = now + ALARM_INTERVAL_SEC
 
-        # daily stats loop
-        if now >= next_daily:
+        if now >= next_flush:
             try:
-                _daily_stats_tick()
+                _flush_tick()
             except Exception as e:
-                logger.exception("[DailyLoop] error: %s", e)
+                logger.exception("[LiveCounters] flush error: %s", e)
             finally:
-                next_daily = now + DAILY_INTERVAL_SEC
+                next_flush = now + FLUSH_INTERVAL_SEC
 
-        # sleep a bit (interruptible)
         _stop_event.wait(0.5)
 
     logger.info("[Scheduler] Loop exited")
 
-# ====== Public APIs ======
-
 def scheduler():
-    """
-    BLOCKING loop variant for backwards compatibility:
-    Use when you want: threading.Thread(target=scheduler, daemon=True).start()
-    This function is idempotent; if the managed thread is already running, it returns immediately.
-    """
+    """Blocking variant."""
     global _loop_started
     with _state_lock:
         if _loop_started:
-            logger.info("[Scheduler] Already running (blocking call ignored)")
+            logger.info("[Scheduler] Already running (blocking)")
             return
         _loop_started = True
         _stop_event.clear()
-
     try:
         _run_loop()
     finally:
@@ -108,9 +105,7 @@ def scheduler():
             _stop_event.set()
 
 def start_scheduler():
-    """
-    Managed, non-blocking start. Safe to call multiple times.
-    """
+    """Non-blocking start."""
     global _thread, _loop_started
     with _state_lock:
         if _loop_started and _thread and _thread.is_alive():
@@ -123,9 +118,6 @@ def start_scheduler():
         _thread.start()
 
 def stop_scheduler():
-    """
-    Stop the loop and join the background thread (if any).
-    """
     global _thread, _loop_started
     with _state_lock:
         if not _loop_started:
