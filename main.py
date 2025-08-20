@@ -205,20 +205,6 @@ def get_my_devices(
     return devices
 
 # --- Optional ops helpers ----------------------------------------------------
-@app.post("/daily_stats/run_now")
-def daily_stats_run_now():
-    """
-    Manually trigger lift-traffic counters over the configured lookback window.
-    Useful during testing or when called by a TB Scheduler node.
-    """
-    try:
-        # lazy import to avoid hard dependency if you don't want this feature
-        from daily_counters import run_once_over_window
-        result = run_once_over_window()
-        return {"ok": True, **result}
-    except Exception as e:
-        logger.exception("daily_stats_run_now error: %s", e)
-        raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/healthz")
 def healthz():
