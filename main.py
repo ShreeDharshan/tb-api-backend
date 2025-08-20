@@ -204,7 +204,7 @@ def get_my_devices(
 
     return devices
 
-# --- Optional ops helpers ----------------------------------------------------
+# --- Optional ops helpers ---------------------------------------------------
 
 @app.get("/healthz")
 def healthz():
