@@ -111,43 +111,50 @@ def tb_save_ts(base: str, jwt: str, device_id: str, values: Dict[str, Any], ts_m
 
 def _extract_pack_out_and_ts(payload: Dict[str, Any]) -> Tuple[Optional[str], int]:
     """
-    Try to find a pack_out string and a timestamp (ms) in flexible payloads.
-    Accepted forms:
-      - {"pack_out": "<json or k=v|k=v>", "ts": 1699999999000}
-      - {"telemetry": {"pack_out": "...", "ts": ...}}
-      - {"data": {"pack_out": "..."}, "ts": ...}
-    If ts is missing, use 'now'.
+    Try to find a pack_out (or pack_raw) string and a timestamp (ms) in flexible payloads.
     """
     ts_ms = int(payload.get("ts") or payload.get("timestamp") or int(time.time() * 1000))
     pack_out = None
 
     # direct
-    if isinstance(payload.get("pack_out"), (str,)):
+    if isinstance(payload.get("pack_out"), str):
         pack_out = payload["pack_out"]
+
+    # NEW: accept pack_raw as alias
+    if pack_out is None and isinstance(payload.get("pack_raw"), str):
+        pack_out = payload["pack_raw"]
 
     # nested "telemetry"
     if pack_out is None:
         telem = payload.get("telemetry")
-        if isinstance(telem, dict) and isinstance(telem.get("pack_out"), str):
-            pack_out = telem["pack_out"]
-        # sometimes pack_out can be nested as object; stringify to store consistently
-        elif isinstance(telem, dict) and isinstance(telem.get("pack_out"), (dict, list)):
-            pack_out = json.dumps(telem["pack_out"], separators=(",", ":"))
+        if isinstance(telem, dict):
+            if isinstance(telem.get("pack_out"), str):
+                pack_out = telem["pack_out"]
+            elif isinstance(telem.get("pack_raw"), str):
+                pack_out = telem["pack_raw"]
+            elif isinstance(telem.get("pack_out"), (dict, list)):
+                pack_out = json.dumps(telem["pack_out"], separators=(",", ":"))
 
     # nested "data"
     if pack_out is None:
         data = payload.get("data")
-        if isinstance(data, dict) and isinstance(data.get("pack_out"), str):
-            pack_out = data["pack_out"]
-        elif isinstance(data, dict) and isinstance(data.get("pack_out"), (dict, list)):
-            pack_out = json.dumps(data["pack_out"], separators=(",", ":"))
+        if isinstance(data, dict):
+            if isinstance(data.get("pack_out"), str):
+                pack_out = data["pack_out"]
+            elif isinstance(data.get("pack_raw"), str):
+                pack_out = data["pack_raw"]
+            elif isinstance(data.get("pack_out"), (dict, list)):
+                pack_out = json.dumps(data["pack_out"], separators=(",", ":"))
 
-    # fallback: accept already-stringified 'payload' field
+    # fallback: accept already-stringified 'payload'
     if pack_out is None and isinstance(payload.get("payload"), str) and "pack_out" in payload["payload"]:
         try:
             j = json.loads(payload["payload"])
-            if isinstance(j, dict) and "pack_out" in j and isinstance(j["pack_out"], str):
-                pack_out = j["pack_out"]
+            if isinstance(j, dict):
+                if isinstance(j.get("pack_out"), str):
+                    pack_out = j["pack_out"]
+                elif isinstance(j.get("pack_raw"), str):
+                    pack_out = j["pack_raw"]
         except Exception:
             pass
 
