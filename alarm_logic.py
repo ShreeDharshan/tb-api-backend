@@ -1,78 +1,54 @@
-# alarm_logic.py
-from __future__ import annotations
-
 import json
 import logging
 import os
 import time
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
 
 import requests
 from fastapi import APIRouter, Header, HTTPException
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, Field
 
-from pack_format import parse_pack_raw, ts_millis, door_to_bit, get_float
-from thingsboard_auth import get_admin_jwt  # signature: get_admin_jwt(account_id: str, host: str) -> str
+from config import TB_ACCOUNTS  # same source as calculated_telemetry
+from thingsboard_auth import get_admin_jwt  # we keep this, we may want to push alarms to TB
 
-logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("alarm_logic")
-
 router = APIRouter()
 
-# ---- Accounts ---------------------------------------------------------------
-def _load_tb_accounts() -> Dict[str, str]:
-    raw = os.getenv("TB_ACCOUNTS", "").strip()
-    if raw:
-        try:
-            data = json.loads(raw)
-            if isinstance(data, dict) and data:
-                return {str(k): str(v) for k, v in data.items()}
-        except Exception as e:
-            logger.warning("[TB_ACCOUNTS] parse failed: %s", e)
-    base = os.getenv("TB_BASE_URL", "https://thingsboard.cloud").strip()
-    return {"default": base}
-
-ACCOUNTS = _load_tb_accounts()
-logger.info("[INIT] Loaded ThingsBoard accounts: %s", list(ACCOUNTS.keys()))
-
-def _resolve_account(x_account_id: Optional[str]) -> str:
-    if x_account_id:
-        if x_account_id in ACCOUNTS:
-            return x_account_id
-        if x_account_id.lower() in ACCOUNTS:
-            return x_account_id.lower()
-    return next(iter(ACCOUNTS.keys()))
-
-# ---- Thresholds & constants --------------------------------------------------
-THRESHOLDS = {
-    "humidity": 50.0,
-    "temperature": 50.0,
-    "x_jerk": 5.0, "y_jerk": 5.0, "z_jerk": 15.0,
-    "x_vibe": 5.0, "y_vibe": 5.0, "z_vibe": 15.0,
-}
-DOOR_OPEN_THRESHOLD_SEC = 15
-TOLERANCE_MM = 10.0
-BUCKET_HALF_MM = 50.0
-MOVEMENT_DEADBAND_MM = 20.0
-FLOOR_CACHE_TTL_SEC = 300
-
-# ---- Payload model -----------------------------------------------------------
-class AlarmIn(BaseModel):
-    deviceName: str = Field(...)
+# -----------------------------------------------------------------------------
+# Pydantic model: accept BOTH old and new formats
+# -----------------------------------------------------------------------------
+class AlarmInput(BaseModel):
+    # new JSON-based payload (what your current TB rule chain sends)
+    deviceName: Optional[str] = Field(default=None)
     device_token: Optional[str] = Field(default=None)
+    current_floor_index: Optional[int] = Field(default=None)
+    lift_status: Optional[str] = Field(default=None)
+    door_open: Optional[bool] = Field(default=None)
+    ts: Optional[int] = Field(default=None)
+    home_floor: Optional[int] = Field(default=None)
 
-    # accept any of these for the packed string
+    # old / string-based / pack-based
     pack_raw: Optional[str] = Field(default=None)
-    pack_out: Optional[str] = Field(default=None)  # NEW: allow pack_out as alias
+    pack_out: Optional[str] = Field(default=None)
     raw: Optional[str] = Field(default=None)
     pack: Optional[str] = Field(default=None)
+
+    # in case TB sends JSON as {"payload": {...}}
     payload: Optional[Dict[str, Any]] = Field(default=None)
 
-    ts: Optional[int] = Field(default=None, description="epoch ms (optional)")
+    def normalize(self) -> "AlarmInput":
+        """
+        Make sure that if TB wrapped the real content in .payload we lift it up.
+        Also let pack_raw come from aliases (raw/pack/pack_out).
+        """
+        # unwrap payload
+        if self.payload and not self.deviceName:
+            # copy keys from payload into self-like dict
+            for k, v in self.payload.items():
+                if getattr(self, k, None) is None:
+                    setattr(self, k, v)
 
-    @model_validator(mode="after")
-    def unify_pack(self):
-        # Normalize to pack_raw
+        # normalize pack-based
         if not self.pack_raw:
             if self.pack_out:
                 self.pack_raw = self.pack_out
@@ -80,281 +56,205 @@ class AlarmIn(BaseModel):
                 self.pack_raw = self.raw
             elif self.pack:
                 self.pack_raw = self.pack
-            elif isinstance(self.payload, dict):
-                self.pack_raw = (
-                    self.payload.get("pack_raw")
-                    or self.payload.get("pack_out")
-                    or self.payload.get("raw")
-                    or self.payload.get("pack")
-                )
+
         return self
 
-# ---- Caches/state ------------------------------------------------------------
-_device_id_cache: Dict[str, str] = {}
-_floor_meta_cache: Dict[str, Dict[str, Any]] = {}
-_device_door_state: Dict[str, bool] = {}
-_door_open_since: Dict[str, float] = {}
-_bucket_counts: Dict[str, Dict[str, List[Dict[str, Any]]]] = {}
-_movement_state: Dict[str, Dict[str, Any]] = {}
 
-# ---- TB helpers --------------------------------------------------------------
-def _admin_headers(account_id: str) -> Dict[str, str]:
-    host = ACCOUNTS[account_id]
-    jwt = get_admin_jwt(account_id, host)
-    return {"Content-Type": "application/json", "X-Authorization": f"Bearer {jwt}"}
+# -----------------------------------------------------------------------------
+# helpers
+# -----------------------------------------------------------------------------
+def _resolve_account(x_account_id: Optional[str]) -> str:
+    if x_account_id and x_account_id in TB_ACCOUNTS:
+        return x_account_id
+    # default to first configured account
+    return next(iter(TB_ACCOUNTS.keys()))
 
-def _get_device_id(device_name: str, account_id: str) -> Optional[str]:
-    cache_key = f"{account_id}:{device_name}"
-    if cache_key in _device_id_cache:
-        return _device_id_cache[cache_key]
-    host = ACCOUNTS[account_id]
-    url = f"{host}/api/tenant/devices?deviceName={device_name}"
-    res = requests.get(url, headers=_admin_headers(account_id), timeout=10)
-    logger.info(f"[DEVICE_LOOKUP] {device_name} ({account_id}) | Status: {res.status_code}")
-    if res.ok:
-        try:
-            device_id = res.json()["id"]["id"]
-            _device_id_cache[cache_key] = device_id
-            return device_id
-        except Exception as e:
-            logger.error(f"[DEVICE_LOOKUP] parse error: {e}")
-    else:
-        logger.error(f"[DEVICE_LOOKUP] {res.status_code} | {res.text}")
-    return None
 
-def _fetch_server_attributes(device_id: str, account_id: str) -> Dict[str, Any]:
-    host = ACCOUNTS[account_id]
-    url = f"{host}/api/plugins/telemetry/DEVICE/{device_id}/values/attributes/SERVER_SCOPE"
-    r = requests.get(url, headers=_admin_headers(account_id), timeout=10)
-    r.raise_for_status()
-    out = {}
-    for item in r.json():
-        out[item["key"]] = item.get("value")
-    return out
-
-def _get_floor_meta(device_name: str, account_id: str) -> Tuple[list, list, Optional[int]]:
-    key = f"{account_id}:{device_name}"
-    now = time.time()
-    cached = _floor_meta_cache.get(key)
-    if cached and now - cached.get("ts", 0) < FLOOR_CACHE_TTL_SEC:
-        return cached["boundaries"], cached["labels"], cached.get("home_floor")
-
-    dev_id = _get_device_id(device_name, account_id)
-    boundaries, labels, home_floor = [], [], None
-    if dev_id:
-        try:
-            attrs = _fetch_server_attributes(dev_id, account_id)
-            fb_raw = attrs.get("floor_boundaries")
-            fl_raw = attrs.get("floor_labels")
-            hf_raw = attrs.get("home_floor")
-            if isinstance(fb_raw, str):
-                boundaries = [int(x.strip()) for x in fb_raw.split(",") if x.strip().lstrip("-").isdigit()]
-            if isinstance(fl_raw, str):
-                labels = [x.strip() for x in fl_raw.split(",")]
-            if isinstance(hf_raw, (int, float, str)) and f"{hf_raw}".lstrip("-").isdigit():
-                home_floor = int(hf_raw)
-        except Exception as e:
-            logger.error(f"[ATTRIBUTES] fetch/parse failed: {e}")
-
-    if not boundaries:
-        boundaries = [0, 3000, 6000, 9000, 12000, 15000, 18000]
-    if not labels:
-        labels = [str(i) for i in range(max(0, len(boundaries) - 1))]
-    labels = labels[: max(0, len(boundaries) - 1)]
-
-    _floor_meta_cache[key] = {"boundaries": boundaries, "labels": labels, "home_floor": home_floor, "ts": now}
-    return boundaries, labels, home_floor
-
-# ---- Core math ---------------------------------------------------------------
-def _compute_height(parsed: Dict[str, Any], boundaries: list) -> float:
-    h = get_float(parsed, "h")
-    if h is not None:
-        return float(h)
-    laser = get_float(parsed, "laser_val")
-    if laser is not None and boundaries:
-        max_b = float(boundaries[-1])
-        return max(0.0, max_b - float(laser))
-    hr = get_float(parsed, "height_raw")
-    if hr is not None:
-        return float(hr)
-    return 0.0
-
-def _floor_index(h: float, boundaries: list) -> int:
-    if len(boundaries) < 2:
-        return 0
-    for i in range(len(boundaries) - 1):
-        if boundaries[i] <= h < boundaries[i + 1]:
-            return i
-    return len(boundaries) - 2
-
-def _derive_motion(device: str, h: float) -> Tuple[str, str, float]:
-    st = _movement_state.setdefault(device, {})
-    prev_h = st.get("prev_h")
-    if prev_h is None:
-        st["prev_h"] = h
-        st["last_ts"] = int(time.time() * 1000)
-        return "S", "I", 0.0
-    vel = h - float(prev_h)
-    if   vel >  MOVEMENT_DEADBAND_MM: dirc, status = "U", "M"
-    elif vel < -MOVEMENT_DEADBAND_MM: dirc, status = "D", "M"
-    else:                             dirc, status = "S", "I"
-    st["prev_h"] = h
-    st["last_ts"] = int(time.time() * 1000)
-    return dirc, status, vel
-
-# ---- Alarms ------------------------------------------------------------------
-def _create_alarm_on_tb(device: str, alarm_type: str, ts_ms: int, severity: str, details: dict, account_id: str):
-    dev_id = _get_device_id(device, account_id)
-    if not dev_id:
-        logger.warning(f"[ALARM] Device ID not found for {device}")
-        return
-    host = ACCOUNTS[account_id]
-    payload = {
-        "originator": {"entityType": "DEVICE", "id": dev_id},
-        "type": alarm_type,
-        "severity": severity,
-        "status": "ACTIVE_UNACK",
-        "details": details,
-    }
-    r = requests.post(f"{host}/api/alarm", headers=_admin_headers(account_id), json=payload, timeout=10)
-    if 200 <= r.status_code < 300:
-        logger.info(f"[ALARM] Created: {alarm_type} ({device})")
-    else:
-        logger.error(f"[ALARM] Failed {r.status_code}: {r.text}")
-
-def _bucket_check_and_trigger(device: str, metric: str, value: float, h: float, ts_ms: int, account_id: str):
-    dev_buckets = _bucket_counts.setdefault(device, {})
-    buckets = dev_buckets.setdefault(metric, [])
-    matched = False
-    for b in list(buckets):
-        if abs(b["center"] - h) <= BUCKET_HALF_MM:
-            b["count"] += 1
-            matched = True
-            if b["count"] >= 3:
-                _create_alarm_on_tb(
-                    device,
-                    f"{metric} Alarm",
-                    ts_ms,
-                    "MINOR",
-                    {"value": value, "threshold": THRESHOLDS[metric],
-                     "height_zone": f"{b['center']-BUCKET_HALF_MM:.1f}..{b['center']+BUCKET_HALF_MM:.1f} mm"},
-                    account_id,
-                )
-                buckets.remove(b)
-            break
-    if not matched:
-        buckets.append({"center": h, "count": 1})
-
-def _process_door_timers(device: str, door_open_bit: Optional[int], ts_ms: int, account_id: str, floor_label: str):
-    now = time.time()
-    if door_open_bit is None:
-        door_open_bit = 1 if _device_door_state.get(device, False) else 0
-    else:
-        _device_door_state[device] = bool(door_open_bit)
-
-    if door_open_bit == 1:
-        if device not in _door_open_since:
-            _door_open_since[device] = now
-        else:
-            duration = now - _door_open_since[device]
-            if duration >= DOOR_OPEN_THRESHOLD_SEC:
-                _create_alarm_on_tb(
-                    device, "Door Open Too Long", ts_ms, "MAJOR",
-                    {"duration_sec": int(duration), "floor": floor_label}, account_id
-                )
-                _door_open_since.pop(device, None)
-    else:
-        _door_open_since.pop(device, None)
-
-def _floor_mismatch(height: float, fi: int, boundaries: list) -> Tuple[bool, float, float]:
-    if height is None or fi is None:
-        return False, 0.0, 0.0
-    if fi >= len(boundaries):
-        return True, 0.0, 0.0
-    floor_center = float(boundaries[fi])
-    deviation = height - floor_center
-    return abs(deviation) > TOLERANCE_MM, deviation, floor_center
-
-# ---- Endpoint ----------------------------------------------------------------
-@router.post("/check_alarm/")
-def check_alarm(
-    payload: AlarmIn,
-    x_account_id: Optional[str] = Header(None, alias="X-Account-Id"),
-    authorization: Optional[str] = Header(None),
-):
+def _create_alarm_in_tb(
+    account_id: str,
+    device_name: str,
+    alarm_type: str,
+    severity: str = "MAJOR",
+    details: Optional[Dict[str, Any]] = None,
+) -> None:
     """
-    Rule Chain posts {deviceName, pack_raw (or pack_out/raw/pack/payload), ts?}.
-    Evaluates alarms and creates TB alarms via admin JWT.
+    Optional: actually create an alarm in TB, using admin JWT.
+    You can comment this out if you just want to RETURN alarms to TB rule chain.
     """
-    account = _resolve_account(x_account_id)
+    try:
+        base_url = TB_ACCOUNTS[account_id]
+        jwt = get_admin_jwt(account_id, base_url)
+        # fetch device id first
+        dev_resp = requests.get(
+            f"{base_url}/api/tenant/devices?deviceName={device_name}",
+            headers={"X-Authorization": f"Bearer {jwt}"},
+            timeout=10,
+        )
+        dev_resp.raise_for_status()
+        dev_data = dev_resp.json()
+        if not (isinstance(dev_data, dict) and "id" in dev_data and "id" in dev_data["id"]):
+            logger.error(f"[TB alarm] device not found: {device_name}")
+            return
+        device_id = dev_data["id"]["id"]
 
-    if not payload.pack_raw:
-        logger.error("[/check_alarm] Missing 'pack_raw' (or alias 'pack_out'/'raw'/'pack')")
-        raise HTTPException(status_code=400, detail="Missing 'pack_raw'")
+        alarm_payload = {
+            "type": alarm_type,
+            "originator": {"entityType": "DEVICE", "id": device_id},
+            "severity": severity,
+            "status": "ACTIVE_UNACK",
+            "details": details or {},
+        }
+        a_resp = requests.post(
+            f"{base_url}/api/alarm",
+            headers={
+                "X-Authorization": f"Bearer {jwt}",
+                "Content-Type": "application/json",
+            },
+            json=alarm_payload,
+            timeout=10,
+        )
+        a_resp.raise_for_status()
+        logger.info(f"[TB alarm] created {alarm_type} for {device_name}")
+    except Exception as e:
+        logger.error(f"[TB alarm] failed to create alarm: {e}")
 
-    device = payload.deviceName
-    parsed = parse_pack_raw(payload.pack_raw)
-    ts_ms = payload.ts if payload.ts is not None else (ts_millis(parsed) or int(time.time() * 1000))
 
-    # Floor meta + core deriveds
-    boundaries, labels, _home = _get_floor_meta(device, account)
-    h = _compute_height(parsed, boundaries)
-    fi = _floor_index(h, boundaries)
-    fl = labels[fi] if 0 <= fi < len(labels) else str(fi)
-    dirc, status, _vel = _derive_motion(device, h)
-    door_bit = door_to_bit(parsed.get("door_val"))
+# -----------------------------------------------------------------------------
+# simple JSON-based alarm rules
+# -----------------------------------------------------------------------------
+def _evaluate_json_alarms(data: AlarmInput) -> List[Dict[str, Any]]:
+    """
+    This is for the CURRENT rule chain shape (JSON, not pack_raw).
 
-    alarm_events: List[Dict[str, Any]] = []
+    We'll just do very simple rules here — extend later:
+    1. door stuck open on a floor
+    2. undefined status
+    """
+    alarms: List[Dict[str, Any]] = []
 
-    # Environment thresholds
-    env_pairs = [
-        ("temperature", get_float(parsed, "temperature", get_float(parsed, "mpu_temp_val"))),
-        ("humidity", get_float(parsed, "humidity", get_float(parsed, "humidity_val"))),
-    ]
-    for name, val in env_pairs:
-        if val is not None and name in THRESHOLDS and float(val) > THRESHOLDS[name]:
-            alarm_events.append({"code": f"{name.upper()}_HIGH", "severity": "WARNING", "value": float(val)})
-            _create_alarm_on_tb(
-                device, f"{name.capitalize()} Alarm", ts_ms, "WARNING",
-                {"value": float(val), "threshold": THRESHOLDS[name], "floor": fl}, account
-            )
+    dev = data.deviceName or "UNKNOWN"
+    floor = data.current_floor_index
+    status = (data.lift_status or "").lower()
+    door = bool(data.door_open)
+    ts = data.ts or int(time.time() * 1000)
 
-    # Vibe/Jerk thresholds with 3-hit bucket logic
-    metric_map = {
-        "x_vibe": get_float(parsed, "x_vibe", get_float(parsed, "accel_x_val")),
-        "y_vibe": get_float(parsed, "y_vibe", get_float(parsed, "accel_y_val")),
-        "z_vibe": get_float(parsed, "z_vibe", get_float(parsed, "accel_z_val")),
-        "x_jerk": get_float(parsed, "x_jerk", get_float(parsed, "gyro_x_val")),
-        "y_jerk": get_float(parsed, "y_jerk", get_float(parsed, "gyro_y_val")),
-        "z_jerk": get_float(parsed, "z_jerk", get_float(parsed, "gyro_z_val")),
-    }
-    for metric, val in metric_map.items():
-        if val is not None and metric in THRESHOLDS and float(val) > THRESHOLDS[metric]:
-            _bucket_check_and_trigger(device, metric, float(val), float(h), ts_ms, account)
-
-    # Door open while moving
-    if status == "M" and door_bit == 1:
-        alarm_events.append({"code": "DOOR_OPEN_WHILE_MOVING", "severity": "CRITICAL", "fi": fi})
-        _create_alarm_on_tb(
-            device, "Door Open While Moving", ts_ms, "CRITICAL",
-            {"fi": fi, "floor": fl, "direction": dirc, "h": round(h)}, account
+    # rule 1: door open while NOT moving
+    if door and status in ("idle", "stopped", ""):
+        alarms.append(
+            {
+                "type": "door_open_idle",
+                "severity": "MAJOR",
+                "ts": ts,
+                "deviceName": dev,
+                "details": {
+                    "floor": floor,
+                    "door_open": door,
+                    "lift_status": status,
+                },
+            }
         )
 
-    # Door-open too long
-    _process_door_timers(device, door_bit, ts_ms, account, fl)
+    # rule 2: unknown status
+    if status not in ("idle", "moving", "door_open", "stopped") and status != "":
+        alarms.append(
+            {
+                "type": "lift_unknown_status",
+                "severity": "MINOR",
+                "ts": ts,
+                "deviceName": dev,
+                "details": {
+                    "seen_status": status,
+                },
+            }
+        )
 
-    # Floor mismatch while door open
-    if door_bit == 1:
-        mismatch, deviation, center = _floor_mismatch(float(h), int(fi), boundaries)
-        if mismatch:
-            pos = "above" if deviation > 0 else "below"
-            alarm_events.append({"code": "FLOOR_MISMATCH", "severity": "CRITICAL", "pos": pos, "dev_mm": abs(deviation)})
-            _create_alarm_on_tb(
-                device, "Floor Mismatch Alarm", ts_ms, "CRITICAL",
-                {"reported_index": fi, "height": round(h), "deviation_mm": round(abs(deviation), 1),
-                 "position": pos, "center": center, "floor": fl},
-                account,
-            )
+    return alarms
 
-    logger.info(f"[ALARM] {device} events={len(alarm_events)} fi={fi} fl={fl} dir={dirc} st={status} h={round(h)}")
-    return {"status": "processed", "alarm_events": alarm_events}
+
+# -----------------------------------------------------------------------------
+# optional: old pack_raw-based evaluator (keep backward compatibility)
+# -----------------------------------------------------------------------------
+def _evaluate_pack_alarms(pack_str: str) -> List[Dict[str, Any]]:
+    """
+    Minimal placeholder evaluator for old pack-based telemetry.
+    We'll just parse it as k=v|k=v... and make the same door-open rule.
+    """
+    alarms: List[Dict[str, Any]] = []
+    parts = pack_str.split("|")
+    data: Dict[str, str] = {}
+    for p in parts:
+        if "=" in p:
+            k, v = p.split("=", 1)
+            data[k.strip()] = v.strip()
+
+    door_val = data.get("door_val") or data.get("door") or ""
+    st = (data.get("st") or "").lower()
+    fl = data.get("fl") or data.get("fi") or None
+    ts = int(time.time() * 1000)
+
+    door_open = door_val.upper() in ("OPEN", "1", "TRUE")
+
+    if door_open and st in ("i", "idle", ""):
+        alarms.append(
+            {
+                "type": "door_open_idle",
+                "severity": "MAJOR",
+                "ts": ts,
+                "deviceName": data.get("deviceName", "UNKNOWN"),
+                "details": {
+                    "floor": fl,
+                    "door_val": door_val,
+                    "status": st,
+                },
+            }
+        )
+
+    return alarms
+
+
+# -----------------------------------------------------------------------------
+# endpoint
+# -----------------------------------------------------------------------------
+@router.post("/check_alarm/")
+async def check_alarm(
+    body: AlarmInput,
+    x_account_id: Optional[str] = Header(None, alias="X-Account-ID"),
+):
+    """
+    This endpoint now supports BOTH:
+    - old pack_raw-based inputs
+    - new JSON-based inputs coming from the old working rule chain
+    """
+    data = body.normalize()
+    account_id = _resolve_account(x_account_id)
+
+    # 1) if we DO have pack_* → use old path
+    if data.pack_raw:
+        alarms = _evaluate_pack_alarms(data.pack_raw)
+        return {
+            "status": "success",
+            "source": "pack",
+            "alarms": alarms,
+        }
+
+    # 2) else, try JSON-style (current situation)
+    if data.deviceName:
+        alarms = _evaluate_json_alarms(data)
+
+        # if you want the backend to ALSO create in TB, uncomment:
+        # for a in alarms:
+        #     _create_alarm_in_tb(account_id, data.deviceName, a["type"], a["severity"], a["details"])
+
+        return {
+            "status": "success",
+            "source": "json",
+            "alarms": alarms,
+        }
+
+    # 3) if neither is present → real bad request
+    logger.error("[/check_alarm] neither pack_raw nor JSON fields were present")
+    raise HTTPException(
+        status_code=400,
+        detail="Missing telemetry: expected JSON (deviceName, current_floor_index, lift_status, door_open) "
+               "or pack_raw/pack_out/raw/pack",
+    )
