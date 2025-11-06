@@ -1,260 +1,445 @@
-import json
-import logging
-import os
-import time
-from typing import Any, Dict, List, Optional
-
-import requests
 from fastapi import APIRouter, Header, HTTPException
 from pydantic import BaseModel, Field
+from typing import Optional, Union, Tuple, Any, Dict, List
+from datetime import datetime
+import requests
+import os
+import logging
+import time
+import json
 
-from config import TB_ACCOUNTS  # same source as calculated_telemetry
-from thingsboard_auth import get_admin_jwt  # we keep this, we may want to push alarms to TB
+from thingsboard_auth import get_admin_jwt
 
+logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("alarm_logic")
+
 router = APIRouter()
 
 # -----------------------------------------------------------------------------
-# Pydantic model: accept BOTH old and new formats
+# Accounts (TB_ACCOUNTS env: {"acctA":"https://tb.hostA","acctB":"https://tb.hostB"})
 # -----------------------------------------------------------------------------
-class AlarmInput(BaseModel):
-    # new JSON-based payload (what your current TB rule chain sends)
-    deviceName: Optional[str] = Field(default=None)
-    device_token: Optional[str] = Field(default=None)
-    current_floor_index: Optional[int] = Field(default=None)
-    lift_status: Optional[str] = Field(default=None)
-    door_open: Optional[bool] = Field(default=None)
-    ts: Optional[int] = Field(default=None)
-    home_floor: Optional[int] = Field(default=None)
+try:
+    ACCOUNTS = json.loads(os.getenv("TB_ACCOUNTS", "{}"))
+    if not isinstance(ACCOUNTS, dict):
+        raise ValueError("TB_ACCOUNTS must be a JSON object")
+except json.JSONDecodeError:
+    raise RuntimeError("Invalid JSON format for TB_ACCOUNTS environment variable")
 
-    # old / string-based / pack-based
-    pack_raw: Optional[str] = Field(default=None)
-    pack_out: Optional[str] = Field(default=None)
-    raw: Optional[str] = Field(default=None)
-    pack: Optional[str] = Field(default=None)
-
-    # in case TB sends JSON as {"payload": {...}}
-    payload: Optional[Dict[str, Any]] = Field(default=None)
-
-    def normalize(self) -> "AlarmInput":
-        """
-        Make sure that if TB wrapped the real content in .payload we lift it up.
-        Also let pack_raw come from aliases (raw/pack/pack_out).
-        """
-        # unwrap payload
-        if self.payload and not self.deviceName:
-            # copy keys from payload into self-like dict
-            for k, v in self.payload.items():
-                if getattr(self, k, None) is None:
-                    setattr(self, k, v)
-
-        # normalize pack-based
-        if not self.pack_raw:
-            if self.pack_out:
-                self.pack_raw = self.pack_out
-            elif self.raw:
-                self.pack_raw = self.raw
-            elif self.pack:
-                self.pack_raw = self.pack
-
-        return self
-
+if not ACCOUNTS:
+    logger.warning("[INIT] No ThingsBoard accounts configured (TB_ACCOUNTS empty)")
+else:
+    logger.info(f"[INIT] Loaded ThingsBoard accounts: {list(ACCOUNTS.keys())}")
 
 # -----------------------------------------------------------------------------
-# helpers
+# Thresholds & constants
 # -----------------------------------------------------------------------------
-def _resolve_account(x_account_id: Optional[str]) -> str:
-    if x_account_id and x_account_id in TB_ACCOUNTS:
-        return x_account_id
-    # default to first configured account
-    return next(iter(TB_ACCOUNTS.keys()))
+THRESHOLDS: Dict[str, float] = {
+    "humidity": 50.0,
+    "temperature": 50.0,
+    "x_jerk": 5.0,
+    "y_jerk": 5.0,
+    "z_jerk": 15.0,
+    "x_vibe": 5.0,
+    "y_vibe": 5.0,
+    "z_vibe": 15.0,
+    "sound_db": 80.0,  # added: do same as vibration/jerk
+}
 
+# +/- 50mm height zone for bucket counting
+ZONE_MM = 50.0
+# count needed within a zone to trigger alarm
+BUCKET_COUNT_THRESHOLD = 3
 
-def _create_alarm_in_tb(
-    account_id: str,
-    device_name: str,
-    alarm_type: str,
-    severity: str = "MAJOR",
-    details: Optional[Dict[str, Any]] = None,
-) -> None:
-    """
-    Optional: actually create an alarm in TB, using admin JWT.
-    You can comment this out if you just want to RETURN alarms to TB rule chain.
-    """
+TOLERANCE_MM = 10.0
+DOOR_OPEN_THRESHOLD_SEC = 15
+
+HTTP_TIMEOUT = 12  # seconds
+
+# -----------------------------------------------------------------------------
+# Payload
+# -----------------------------------------------------------------------------
+class TelemetryPayload(BaseModel):
+    deviceName: str = Field(...)
+    floor: str = Field(...)
+    # allow str/int; most of the pipeline expects ms since epoch
+    timestamp: Optional[Union[int, str]] = Field(default=None)
+
+    height: Optional[Union[float, str]] = Field(default=None)
+    current_floor_index: Optional[Union[int, str]] = Field(default=None)
+
+    x_vibe: Optional[Union[float, str]] = Field(default=None)
+    y_vibe: Optional[Union[float, str]] = Field(default=None)
+    z_vibe: Optional[Union[float, str]] = Field(default=None)
+
+    x_jerk: Optional[Union[float, str]] = Field(default=None)
+    y_jerk: Optional[Union[float, str]] = Field(default=None)
+    z_jerk: Optional[Union[float, str]] = Field(default=None)
+
+    temperature: Optional[Union[float, str]] = Field(default=None)
+    humidity: Optional[Union[float, str]] = Field(default=None)
+
+    door_open: Optional[Union[bool, str, int]] = Field(default=None)
+
+    # optional sound telemetry
+    sound_db: Optional[Union[float, str]] = Field(default=None)
+
+# -----------------------------------------------------------------------------
+# In-memory state
+# -----------------------------------------------------------------------------
+device_cache: Dict[str, str] = {}                # (account:deviceName) -> deviceId
+bucket_counts: Dict[str, Dict[str, List[Dict]]] = {}  # device -> key -> list[{center,count}]
+device_door_state: Dict[str, bool] = {}
+door_open_since: Dict[str, float] = {}           # seconds monotonic
+
+# -----------------------------------------------------------------------------
+# Parsers / helpers
+# -----------------------------------------------------------------------------
+def parse_float(value: Any) -> Optional[float]:
     try:
-        base_url = TB_ACCOUNTS[account_id]
-        jwt = get_admin_jwt(account_id, base_url)
-        # fetch device id first
-        dev_resp = requests.get(
-            f"{base_url}/api/tenant/devices?deviceName={device_name}",
-            headers={"X-Authorization": f"Bearer {jwt}"},
-            timeout=10,
-        )
-        dev_resp.raise_for_status()
-        dev_data = dev_resp.json()
-        if not (isinstance(dev_data, dict) and "id" in dev_data and "id" in dev_data["id"]):
-            logger.error(f"[TB alarm] device not found: {device_name}")
-            return
-        device_id = dev_data["id"]["id"]
+        if value is None or value == "":
+            return None
+        return float(value)
+    except (ValueError, TypeError):
+        return None
 
-        alarm_payload = {
-            "type": alarm_type,
-            "originator": {"entityType": "DEVICE", "id": device_id},
-            "severity": severity,
-            "status": "ACTIVE_UNACK",
-            "details": details or {},
-        }
-        a_resp = requests.post(
-            f"{base_url}/api/alarm",
-            headers={
-                "X-Authorization": f"Bearer {jwt}",
-                "Content-Type": "application/json",
-            },
-            json=alarm_payload,
-            timeout=10,
-        )
-        a_resp.raise_for_status()
-        logger.info(f"[TB alarm] created {alarm_type} for {device_name}")
+def parse_int(value: Any) -> Optional[int]:
+    try:
+        if value is None or value == "":
+            return None
+        return int(value)
+    except (ValueError, TypeError):
+        return None
+
+def parse_bool(value: Any) -> Optional[bool]:
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(int(value))
+    if isinstance(value, str):
+        v = value.strip().lower()
+        if v in ("true", "1", "yes", "open", "on"):
+            return True
+        if v in ("false", "0", "no", "closed", "off"):
+            return False
+    return None
+
+def epoch_ms_from_any(ts: Optional[Union[int, str]]) -> int:
+    """
+    Accept int ms, int sec, or ISO string. Fall back to now.
+    """
+    if ts is None:
+        return int(time.time() * 1000)
+    if isinstance(ts, int):
+        # assume ms if very large, else seconds
+        return ts if ts > 1_000_000_000_000 else ts * 1000
+    if isinstance(ts, str):
+        s = ts.strip()
+        # if numeric string
+        if s.isdigit():
+            iv = int(s)
+            return iv if iv > 1_000_000_000_000 else iv * 1000
+        try:
+            dt = datetime.fromisoformat(s.replace("Z", "+00:00"))
+            return int(dt.timestamp() * 1000)
+        except Exception:
+            pass
+    return int(time.time() * 1000)
+
+def quoted(s: str) -> str:
+    return requests.utils.quote(s, safe="")
+
+# -----------------------------------------------------------------------------
+# ThingsBoard API helpers
+# -----------------------------------------------------------------------------
+def get_device_id(device_name: str, account_id: str) -> Optional[str]:
+    cache_key = f"{account_id}:{device_name}"
+    if cache_key in device_cache:
+        return device_cache[cache_key]
+
+    base = ACCOUNTS.get(account_id)
+    if not base:
+        logger.error(f"[DEVICE_LOOKUP] Unknown account_id={account_id}")
+        return None
+
+    jwt = get_admin_jwt(account_id, base)
+    if not jwt:
+        logger.error(f"[DEVICE_LOOKUP] No JWT for account={account_id}")
+        return None
+
+    url = f"{base}/api/tenant/devices?deviceName={quoted(device_name)}"
+    try:
+        res = requests.get(url, headers={"X-Authorization": f"Bearer {jwt}"}, timeout=HTTP_TIMEOUT)
+        if res.status_code == 200:
+            data = res.json()
+            if isinstance(data, dict) and data.get("id", {}).get("id"):
+                device_id = data["id"]["id"]
+                device_cache[cache_key] = device_id
+                return device_id
+        logger.error(f"[DEVICE_LOOKUP] Failed {res.status_code} | {res.text}")
     except Exception as e:
-        logger.error(f"[TB alarm] failed to create alarm: {e}")
+        logger.error(f"[DEVICE_LOOKUP] Exception: {e}")
+    return None
 
+def get_floor_boundaries(device_id: str, account_id: str) -> Optional[List[float]]:
+    base = ACCOUNTS.get(account_id)
+    if not base:
+        return None
+    jwt = get_admin_jwt(account_id, base)
+    if not jwt:
+        logger.warning("[ATTRIBUTES] No JWT; cannot fetch floor_boundaries")
+        return None
 
-# -----------------------------------------------------------------------------
-# simple JSON-based alarm rules
-# -----------------------------------------------------------------------------
-def _evaluate_json_alarms(data: AlarmInput) -> List[Dict[str, Any]]:
-    """
-    This is for the CURRENT rule chain shape (JSON, not pack_raw).
+    url = f"{base}/api/plugins/telemetry/DEVICE/{device_id}/values/attributes/SERVER_SCOPE"
+    try:
+        res = requests.get(url, headers={"X-Authorization": f"Bearer {jwt}"}, timeout=HTTP_TIMEOUT)
+        if res.status_code != 200:
+            logger.error(f"[ATTRIBUTES] Failed {res.status_code} | {res.text}")
+            return None
 
-    We'll just do very simple rules here — extend later:
-    1. door stuck open on a floor
-    2. undefined status
-    """
-    alarms: List[Dict[str, Any]] = []
+        for attr in res.json() or []:
+            if attr.get("key") == "floor_boundaries":
+                val = attr.get("value")
+                # accept list, JSON string, or comma string
+                if isinstance(val, list):
+                    return [float(x) for x in val]
+                if isinstance(val, str):
+                    try:
+                        j = json.loads(val)
+                        if isinstance(j, list):
+                            return [float(x) for x in j]
+                    except Exception:
+                        pass
+                    # fallback: comma string
+                    return [float(x.strip()) for x in val.split(",") if x.strip()]
+        return None
+    except Exception as e:
+        logger.error(f"[ATTRIBUTES] Exception: {e}")
+        return None
 
-    dev = data.deviceName or "UNKNOWN"
-    floor = data.current_floor_index
-    status = (data.lift_status or "").lower()
-    door = bool(data.door_open)
-    ts = data.ts or int(time.time() * 1000)
+def create_alarm_on_tb(device_name: str, alarm_type: str, ts_ms: int, severity: str, details: dict, account_id: str):
+    base = ACCOUNTS.get(account_id)
+    if not base:
+        logger.warning(f"[ALARM] Unknown account {account_id}")
+        return
 
-    # rule 1: door open while NOT moving
-    if door and status in ("idle", "stopped", ""):
-        alarms.append(
-            {
-                "type": "door_open_idle",
-                "severity": "MAJOR",
-                "ts": ts,
-                "deviceName": dev,
-                "details": {
-                    "floor": floor,
-                    "door_open": door,
-                    "lift_status": status,
-                },
-            }
+    device_id = get_device_id(device_name, account_id)
+    if not device_id:
+        logger.warning(f"[ALARM] Could not resolve device ID for {device_name}")
+        return
+
+    jwt = get_admin_jwt(account_id, base)
+    if not jwt:
+        logger.warning(f"[ALARM] No JWT for account {account_id}")
+        return
+
+    alarm_payload = {
+        "originator": {"entityType": "DEVICE", "id": device_id},
+        "type": alarm_type,
+        "severity": severity,  # WARNING/MINOR/MAJOR/CRITICAL
+        "status": "ACTIVE_UNACK",
+        "details": details or {},
+        "startTs": ts_ms,
+    }
+    try:
+        resp = requests.post(
+            f"{base}/api/alarm",
+            headers={"X-Authorization": f"Bearer {jwt}", "Content-Type": "application/json"},
+            json=alarm_payload,
+            timeout=HTTP_TIMEOUT,
         )
-
-    # rule 2: unknown status
-    if status not in ("idle", "moving", "door_open", "stopped") and status != "":
-        alarms.append(
-            {
-                "type": "lift_unknown_status",
-                "severity": "MINOR",
-                "ts": ts,
-                "deviceName": dev,
-                "details": {
-                    "seen_status": status,
-                },
-            }
-        )
-
-    return alarms
-
+        if 200 <= resp.status_code < 300:
+            logger.info(f"[ALARM] Created {alarm_type} for {device_name}")
+        else:
+            logger.error(f"[ALARM] Failed {resp.status_code} | {resp.text}")
+    except Exception as e:
+        logger.error(f"[ALARM] Exception: {e}")
 
 # -----------------------------------------------------------------------------
-# optional: old pack_raw-based evaluator (keep backward compatibility)
+# Alarm logic helpers
 # -----------------------------------------------------------------------------
-def _evaluate_pack_alarms(pack_str: str) -> List[Dict[str, Any]]:
-    """
-    Minimal placeholder evaluator for old pack-based telemetry.
-    We'll just parse it as k=v|k=v... and make the same door-open rule.
-    """
-    alarms: List[Dict[str, Any]] = []
-    parts = pack_str.split("|")
-    data: Dict[str, str] = {}
-    for p in parts:
-        if "=" in p:
-            k, v = p.split("=", 1)
-            data[k.strip()] = v.strip()
+def check_bucket_and_trigger(
+    device: str,
+    key: str,
+    value: float,
+    height: Optional[float],
+    ts_ms: int,
+    floor: str,
+    account_id: str,
+):
+    """Count threshold breaches within a +/- ZONE_MM window around height; fire at count>=3."""
+    if height is None:
+        # Cannot bucket by height without a height reading
+        return
 
-    door_val = data.get("door_val") or data.get("door") or ""
-    st = (data.get("st") or "").lower()
-    fl = data.get("fl") or data.get("fi") or None
-    ts = int(time.time() * 1000)
+    if device not in bucket_counts:
+        bucket_counts[device] = {}
+    if key not in bucket_counts[device]:
+        bucket_counts[device][key] = []
 
-    door_open = door_val.upper() in ("OPEN", "1", "TRUE")
+    buckets = bucket_counts[device][key]
+    for b in buckets:
+        if abs(b["center"] - height) <= ZONE_MM:
+            b["count"] += 1
+            if b["count"] >= BUCKET_COUNT_THRESHOLD:
+                create_alarm_on_tb(
+                    device,
+                    f"{key} Alarm",
+                    ts_ms,
+                    "MINOR",
+                    {
+                        "value": value,
+                        "threshold": THRESHOLDS[key],
+                        "floor": floor,
+                        "height_zone": f"{b['center']-ZONE_MM:.1f} to {b['center']+ZONE_MM:.1f}",
+                        "count": b["count"],
+                    },
+                    account_id,
+                )
+                buckets.remove(b)
+            return
 
-    if door_open and st in ("i", "idle", ""):
-        alarms.append(
-            {
-                "type": "door_open_idle",
-                "severity": "MAJOR",
-                "ts": ts,
-                "deviceName": data.get("deviceName", "UNKNOWN"),
-                "details": {
-                    "floor": fl,
-                    "door_val": door_val,
-                    "status": st,
-                },
-            }
-        )
+    # no matching bucket: create a new one
+    buckets.append({"center": height, "count": 1})
 
-    return alarms
+def process_door_alarm(device_name: str, door_open_in: Optional[bool], floor: str, ts_ms: int, account_id: str):
+    now = time.monotonic()
+    door_open = door_open_in
+    if door_open is None:
+        door_open = device_door_state.get(device_name, False)
+    else:
+        device_door_state[device_name] = door_open
 
+    if door_open:
+        if device_name not in door_open_since:
+            door_open_since[device_name] = now
+        else:
+            duration = now - door_open_since[device_name]
+            if duration >= DOOR_OPEN_THRESHOLD_SEC:
+                create_alarm_on_tb(
+                    device_name,
+                    "Door Open Too Long",
+                    ts_ms,
+                    "MAJOR",
+                    {"duration_sec": int(duration), "floor": floor},
+                    account_id,
+                )
+                # reset so it must exceed the window again
+                door_open_since[device_name] = now
+    else:
+        door_open_since.pop(device_name, None)
+
+def floor_mismatch_detected(height: Optional[float], current_floor_index: Optional[int], floor_boundaries: Optional[List[float]]) -> Tuple[bool, float, float]:
+    if height is None or current_floor_index is None or floor_boundaries is None:
+        return False, 0.0, 0.0
+
+    try:
+        if current_floor_index < 0 or current_floor_index >= len(floor_boundaries):
+            return False, 0.0, 0.0  # out of range -> don't alarm here
+        floor_center = float(floor_boundaries[current_floor_index])
+        deviation = height - floor_center
+        return abs(deviation) > TOLERANCE_MM, deviation, floor_center
+    except Exception as e:
+        logger.error(f"[FLOOR] floor mismatch calc failed: {e}")
+        return False, 0.0, 0.0
 
 # -----------------------------------------------------------------------------
-# endpoint
+# Endpoint
 # -----------------------------------------------------------------------------
 @router.post("/check_alarm/")
 async def check_alarm(
-    body: AlarmInput,
-    x_account_id: Optional[str] = Header(None, alias="X-Account-ID"),
+    payload: TelemetryPayload,
+    x_account_id: str = Header(...),
 ):
-    """
-    This endpoint now supports BOTH:
-    - old pack_raw-based inputs
-    - new JSON-based inputs coming from the old working rule chain
-    """
-    data = body.normalize()
-    account_id = _resolve_account(x_account_id)
+    logger.info("--- /check_alarm/ invoked ---")
 
-    # 1) if we DO have pack_* → use old path
-    if data.pack_raw:
-        alarms = _evaluate_pack_alarms(data.pack_raw)
-        return {
-            "status": "success",
-            "source": "pack",
-            "alarms": alarms,
-        }
+    if x_account_id not in ACCOUNTS:
+        raise HTTPException(status_code=400, detail="Invalid account ID")
 
-    # 2) else, try JSON-style (current situation)
-    if data.deviceName:
-        alarms = _evaluate_json_alarms(data)
+    # Prefer device-provided timestamp if present
+    ts_ms = epoch_ms_from_any(payload.timestamp)
 
-        # if you want the backend to ALSO create in TB, uncomment:
-        # for a in alarms:
-        #     _create_alarm_in_tb(account_id, data.deviceName, a["type"], a["severity"], a["details"])
+    # Parse core fields safely
+    height = parse_float(payload.height)
+    cfi = parse_int(payload.current_floor_index)
 
-        return {
-            "status": "success",
-            "source": "json",
-            "alarms": alarms,
-        }
+    # Normalize door boolean
+    door_bool = parse_bool(payload.door_open)
+    if door_bool is None:
+        # keep last known state if not provided
+        door_bool = device_door_state.get(payload.deviceName, False)
 
-    # 3) if neither is present → real bad request
-    logger.error("[/check_alarm] neither pack_raw nor JSON fields were present")
-    raise HTTPException(
-        status_code=400,
-        detail="Missing telemetry: expected JSON (deviceName, current_floor_index, lift_status, door_open) "
-               "or pack_raw/pack_out/raw/pack",
-    )
+    triggered: List[Dict[str, Any]] = []
+
+    try:
+        # Simple scalar alarms (no bucketing)
+        for k in ("humidity", "temperature"):
+            val = parse_float(getattr(payload, k))
+            if val is not None and k in THRESHOLDS and val > THRESHOLDS[k]:
+                triggered.append(
+                    {
+                        "type": f"{k.capitalize()} Alarm",
+                        "value": val,
+                        "threshold": THRESHOLDS[k],
+                        "severity": "WARNING",
+                    }
+                )
+                create_alarm_on_tb(
+                    payload.deviceName,
+                    f"{k.capitalize()} Alarm",
+                    ts_ms,
+                    "WARNING",
+                    {"value": val, "threshold": THRESHOLDS[k], "floor": payload.floor},
+                    x_account_id,
+                )
+
+        # Bucketed alarms: jerk, vibration, and sound (if provided)
+        for key in ("x_jerk", "y_jerk", "z_jerk", "x_vibe", "y_vibe", "z_vibe", "sound_db"):
+            val = parse_float(getattr(payload, key))
+            thr = THRESHOLDS.get(key)
+            if val is not None and thr is not None and val > thr:
+                check_bucket_and_trigger(payload.deviceName, key, val, height, ts_ms, payload.floor, x_account_id)
+
+        # Floor mismatch check only when door is open and we have a floor index
+        if cfi is not None and door_bool:
+            device_id = get_device_id(payload.deviceName, x_account_id)
+            if device_id:
+                floor_boundaries = get_floor_boundaries(device_id, x_account_id)
+                mismatch, deviation, floor_center = floor_mismatch_detected(height, cfi, floor_boundaries)
+                if mismatch:
+                    position = "above" if deviation > 0 else "below"
+                    triggered.append(
+                        {
+                            "type": "Floor Mismatch Alarm",
+                            "value": height,
+                            "severity": "CRITICAL",
+                            "position": position,
+                        }
+                    )
+                    create_alarm_on_tb(
+                        payload.deviceName,
+                        "Floor Mismatch Alarm",
+                        ts_ms,
+                        "CRITICAL",
+                        {
+                            "reported_index": cfi,
+                            "height": height,
+                            "floor_center": floor_center,
+                            "deviation_mm": abs(deviation),
+                            "position": position,
+                        },
+                        x_account_id,
+                    )
+
+        # Door-open-duration alarm (monotonic clock to prevent ts skew)
+        process_door_alarm(payload.deviceName, door_bool, payload.floor, ts_ms, x_account_id)
+
+        logger.info(f"[RESULT] {payload.deviceName} alarms_triggered={len(triggered)}")
+        return {"status": "processed", "alarms_triggered": triggered}
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"[ERROR] Exception during alarm processing: {e}")
+        raise HTTPException(status_code=500, detail="Alarm processing failed")
