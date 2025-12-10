@@ -19,7 +19,7 @@ router = APIRouter()
 # Accounts (TB_ACCOUNTS env: {"acctA":"https://tb.hostA","acctB":"https://tb.hostB"})
 # -----------------------------------------------------------------------------
 try:
-    ACCOUNTS = json.loads(os.getenv("TB_ACCOUNTS", "{}"))
+    ACCOUNTS: Dict[str, str] = json.loads(os.getenv("TB_ACCOUNTS", "{}"))
     if not isinstance(ACCOUNTS, dict):
         raise ValueError("TB_ACCOUNTS must be a JSON object")
 except json.JSONDecodeError:
@@ -42,11 +42,11 @@ THRESHOLDS: Dict[str, float] = {
     "x_vibe": 5.0,
     "y_vibe": 5.0,
     "z_vibe": 15.0,
-    "sound_db": 80.0,  # added: do same as vibration/jerk
+    "sound_db": 80.0,
 }
 
-# +/- 50mm height zone for bucket counting
-ZONE_MM = 50.0
+# +/- 2000mm height zone for bucket counting (total window = 4000mm)
+ZONE_MM = 2000.0
 # count needed within a zone to trigger alarm
 BUCKET_COUNT_THRESHOLD = 3
 
@@ -80,16 +80,18 @@ class TelemetryPayload(BaseModel):
 
     door_open: Optional[Union[bool, str, int]] = Field(default=None)
 
-    # optional sound telemetry
     sound_db: Optional[Union[float, str]] = Field(default=None)
 
 # -----------------------------------------------------------------------------
-# In-memory state
+# In-memory state (per-process)
 # -----------------------------------------------------------------------------
-device_cache: Dict[str, str] = {}                # (account:deviceName) -> deviceId
-bucket_counts: Dict[str, Dict[str, List[Dict]]] = {}  # device -> key -> list[{center,count}]
+device_cache: Dict[str, str] = {}  # (account:deviceName) -> deviceId
+bucket_counts: Dict[str, Dict[str, List[Dict[str, Any]]]] = {}  # device -> key -> list[{center,count}]
 device_door_state: Dict[str, bool] = {}
-door_open_since: Dict[str, float] = {}           # seconds monotonic
+door_open_since: Dict[str, float] = {}  # seconds monotonic
+
+# Cache for floor boundaries: "{account_id}:{device_id}" -> List[float]
+floor_boundaries_cache: Dict[str, List[float]] = {}
 
 # -----------------------------------------------------------------------------
 # Parsers / helpers
@@ -102,6 +104,7 @@ def parse_float(value: Any) -> Optional[float]:
     except (ValueError, TypeError):
         return None
 
+
 def parse_int(value: Any) -> Optional[int]:
     try:
         if value is None or value == "":
@@ -109,6 +112,7 @@ def parse_int(value: Any) -> Optional[int]:
         return int(value)
     except (ValueError, TypeError):
         return None
+
 
 def parse_bool(value: Any) -> Optional[bool]:
     if value is None:
@@ -124,6 +128,7 @@ def parse_bool(value: Any) -> Optional[bool]:
         if v in ("false", "0", "no", "closed", "off"):
             return False
     return None
+
 
 def epoch_ms_from_any(ts: Optional[Union[int, str]]) -> int:
     """
@@ -147,11 +152,12 @@ def epoch_ms_from_any(ts: Optional[Union[int, str]]) -> int:
             pass
     return int(time.time() * 1000)
 
+
 def quoted(s: str) -> str:
     return requests.utils.quote(s, safe="")
 
 # -----------------------------------------------------------------------------
-# ThingsBoard API helpers
+# ThingsBoard helpers
 # -----------------------------------------------------------------------------
 def get_device_id(device_name: str, account_id: str) -> Optional[str]:
     cache_key = f"{account_id}:{device_name}"
@@ -170,7 +176,11 @@ def get_device_id(device_name: str, account_id: str) -> Optional[str]:
 
     url = f"{base}/api/tenant/devices?deviceName={quoted(device_name)}"
     try:
-        res = requests.get(url, headers={"X-Authorization": f"Bearer {jwt}"}, timeout=HTTP_TIMEOUT)
+        res = requests.get(
+            url,
+            headers={"X-Authorization": f"Bearer {jwt}"},
+            timeout=HTTP_TIMEOUT,
+        )
         if res.status_code == 200:
             data = res.json()
             if isinstance(data, dict) and data.get("id", {}).get("id"):
@@ -182,7 +192,16 @@ def get_device_id(device_name: str, account_id: str) -> Optional[str]:
         logger.error(f"[DEVICE_LOOKUP] Exception: {e}")
     return None
 
+
 def get_floor_boundaries(device_id: str, account_id: str) -> Optional[List[float]]:
+    """
+    Fetch and cache floor_boundaries SERVER_SCOPE attribute for device.
+    Cached per (account_id, device_id) to avoid repeated TB calls.
+    """
+    cache_key = f"{account_id}:{device_id}"
+    if cache_key in floor_boundaries_cache:
+        return floor_boundaries_cache[cache_key]
+
     base = ACCOUNTS.get(account_id)
     if not base:
         return None
@@ -193,32 +212,48 @@ def get_floor_boundaries(device_id: str, account_id: str) -> Optional[List[float
 
     url = f"{base}/api/plugins/telemetry/DEVICE/{device_id}/values/attributes/SERVER_SCOPE"
     try:
-        res = requests.get(url, headers={"X-Authorization": f"Bearer {jwt}"}, timeout=HTTP_TIMEOUT)
+        res = requests.get(
+            url,
+            headers={"X-Authorization": f"Bearer {jwt}"},
+            timeout=HTTP_TIMEOUT,
+        )
         if res.status_code != 200:
             logger.error(f"[ATTRIBUTES] Failed {res.status_code} | {res.text}")
             return None
 
+        fb: Optional[List[float]] = None
         for attr in res.json() or []:
             if attr.get("key") == "floor_boundaries":
                 val = attr.get("value")
-                # accept list, JSON string, or comma string
                 if isinstance(val, list):
-                    return [float(x) for x in val]
-                if isinstance(val, str):
+                    fb = [float(x) for x in val]
+                elif isinstance(val, str):
+                    # try JSON first
                     try:
                         j = json.loads(val)
                         if isinstance(j, list):
-                            return [float(x) for x in j]
+                            fb = [float(x) for x in j]
                     except Exception:
-                        pass
-                    # fallback: comma string
-                    return [float(x.strip()) for x in val.split(",") if x.strip()]
-        return None
+                        # fallback: comma-separated string
+                        fb = [float(x.strip()) for x in val.split(",") if x.strip()]
+                break
+
+        if fb is not None:
+            floor_boundaries_cache[cache_key] = fb
+        return fb
     except Exception as e:
         logger.error(f"[ATTRIBUTES] Exception: {e}")
         return None
 
-def create_alarm_on_tb(device_name: str, alarm_type: str, ts_ms: int, severity: str, details: dict, account_id: str):
+
+def create_alarm_on_tb(
+    device_name: str,
+    alarm_type: str,
+    ts_ms: int,
+    severity: str,
+    details: Dict[str, Any],
+    account_id: str,
+) -> None:
     base = ACCOUNTS.get(account_id)
     if not base:
         logger.warning(f"[ALARM] Unknown account {account_id}")
@@ -245,7 +280,10 @@ def create_alarm_on_tb(device_name: str, alarm_type: str, ts_ms: int, severity: 
     try:
         resp = requests.post(
             f"{base}/api/alarm",
-            headers={"X-Authorization": f"Bearer {jwt}", "Content-Type": "application/json"},
+            headers={
+                "X-Authorization": f"Bearer {jwt}",
+                "Content-Type": "application/json",
+            },
             json=alarm_payload,
             timeout=HTTP_TIMEOUT,
         )
@@ -267,11 +305,16 @@ def check_bucket_and_trigger(
     ts_ms: int,
     floor: str,
     account_id: str,
-):
-    """Count threshold breaches within a +/- ZONE_MM window around height; fire at count>=3."""
+) -> Optional[Dict[str, Any]]:
+    """
+    Count threshold breaches within a +/- ZONE_MM window around height.
+    If BUCKET_COUNT_THRESHOLD is reached, create TB alarm and return a summary dict
+    so the caller can include it in the API response.
+    Time complexity: O(B) over number of buckets for (device,key).
+    """
     if height is None:
         # Cannot bucket by height without a height reading
-        return
+        return None
 
     if device not in bucket_counts:
         bucket_counts[device] = {}
@@ -283,27 +326,47 @@ def check_bucket_and_trigger(
         if abs(b["center"] - height) <= ZONE_MM:
             b["count"] += 1
             if b["count"] >= BUCKET_COUNT_THRESHOLD:
+                alarm_type = f"{key} Alarm"
+                details = {
+                    "value": value,
+                    "threshold": THRESHOLDS[key],
+                    "floor": floor,
+                    "height_zone": f"{b['center'] - ZONE_MM:.1f} to {b['center'] + ZONE_MM:.1f}",
+                    "count": b["count"],
+                }
                 create_alarm_on_tb(
                     device,
-                    f"{key} Alarm",
+                    alarm_type,
                     ts_ms,
                     "MINOR",
-                    {
-                        "value": value,
-                        "threshold": THRESHOLDS[key],
-                        "floor": floor,
-                        "height_zone": f"{b['center']-ZONE_MM:.1f} to {b['center']+ZONE_MM:.1f}",
-                        "count": b["count"],
-                    },
+                    details,
                     account_id,
                 )
+                # remove the bucket and return summary
                 buckets.remove(b)
-            return
+                return {
+                    "type": alarm_type,
+                    "value": value,
+                    "threshold": THRESHOLDS[key],
+                    "severity": "MINOR",
+                    "floor": floor,
+                    "height_zone": details["height_zone"],
+                    "count": b["count"],
+                }
+            return None
 
     # no matching bucket: create a new one
     buckets.append({"center": height, "count": 1})
+    return None
 
-def process_door_alarm(device_name: str, door_open_in: Optional[bool], floor: str, ts_ms: int, account_id: str):
+
+def process_door_alarm(
+    device_name: str,
+    door_open_in: Optional[bool],
+    floor: str,
+    ts_ms: int,
+    account_id: str,
+) -> None:
     now = time.monotonic()
     door_open = door_open_in
     if door_open is None:
@@ -330,7 +393,16 @@ def process_door_alarm(device_name: str, door_open_in: Optional[bool], floor: st
     else:
         door_open_since.pop(device_name, None)
 
-def floor_mismatch_detected(height: Optional[float], current_floor_index: Optional[int], floor_boundaries: Optional[List[float]]) -> Tuple[bool, float, float]:
+
+def floor_mismatch_detected(
+    height: Optional[float],
+    current_floor_index: Optional[int],
+    floor_boundaries: Optional[List[float]],
+) -> Tuple[bool, float, float]:
+    """
+    Returns:
+        (mismatch_detected, deviation_mm, floor_center_mm)
+    """
     if height is None or current_floor_index is None or floor_boundaries is None:
         return False, 0.0, 0.0
 
@@ -364,7 +436,6 @@ async def check_alarm(
     height = parse_float(payload.height)
     cfi = parse_int(payload.current_floor_index)
 
-    # Normalize door boolean
     door_bool = parse_bool(payload.door_open)
     if door_bool is None:
         # keep last known state if not provided
@@ -377,46 +448,70 @@ async def check_alarm(
         for k in ("humidity", "temperature"):
             val = parse_float(getattr(payload, k))
             if val is not None and k in THRESHOLDS and val > THRESHOLDS[k]:
-                triggered.append(
-                    {
-                        "type": f"{k.capitalize()} Alarm",
-                        "value": val,
-                        "threshold": THRESHOLDS[k],
-                        "severity": "WARNING",
-                    }
-                )
+                summary = {
+                    "type": f"{k.capitalize()} Alarm",
+                    "value": val,
+                    "threshold": THRESHOLDS[k],
+                    "severity": "WARNING",
+                    "floor": payload.floor,
+                }
+                triggered.append(summary)
                 create_alarm_on_tb(
                     payload.deviceName,
-                    f"{k.capitalize()} Alarm",
+                    summary["type"],
                     ts_ms,
                     "WARNING",
-                    {"value": val, "threshold": THRESHOLDS[k], "floor": payload.floor},
+                    {
+                        "value": val,
+                        "threshold": THRESHOLDS[k],
+                        "floor": payload.floor,
+                    },
                     x_account_id,
                 )
 
         # Bucketed alarms: jerk, vibration, and sound (if provided)
-        for key in ("x_jerk", "y_jerk", "z_jerk", "x_vibe", "y_vibe", "z_vibe", "sound_db"):
+        for key in (
+            "x_jerk",
+            "y_jerk",
+            "z_jerk",
+            "x_vibe",
+            "y_vibe",
+            "z_vibe",
+            "sound_db",
+        ):
             val = parse_float(getattr(payload, key))
             thr = THRESHOLDS.get(key)
             if val is not None and thr is not None and val > thr:
-                check_bucket_and_trigger(payload.deviceName, key, val, height, ts_ms, payload.floor, x_account_id)
+                bucket_alarm = check_bucket_and_trigger(
+                    payload.deviceName,
+                    key,
+                    val,
+                    height,
+                    ts_ms,
+                    payload.floor,
+                    x_account_id,
+                )
+                if bucket_alarm is not None:
+                    triggered.append(bucket_alarm)
 
         # Floor mismatch check only when door is open and we have a floor index
         if cfi is not None and door_bool:
             device_id = get_device_id(payload.deviceName, x_account_id)
             if device_id:
                 floor_boundaries = get_floor_boundaries(device_id, x_account_id)
-                mismatch, deviation, floor_center = floor_mismatch_detected(height, cfi, floor_boundaries)
+                mismatch, deviation, floor_center = floor_mismatch_detected(
+                    height, cfi, floor_boundaries
+                )
                 if mismatch:
                     position = "above" if deviation > 0 else "below"
-                    triggered.append(
-                        {
-                            "type": "Floor Mismatch Alarm",
-                            "value": height,
-                            "severity": "CRITICAL",
-                            "position": position,
-                        }
-                    )
+                    summary = {
+                        "type": "Floor Mismatch Alarm",
+                        "value": height,
+                        "severity": "CRITICAL",
+                        "position": position,
+                        "floor_index": cfi,
+                    }
+                    triggered.append(summary)
                     create_alarm_on_tb(
                         payload.deviceName,
                         "Floor Mismatch Alarm",
@@ -433,7 +528,9 @@ async def check_alarm(
                     )
 
         # Door-open-duration alarm (monotonic clock to prevent ts skew)
-        process_door_alarm(payload.deviceName, door_bool, payload.floor, ts_ms, x_account_id)
+        process_door_alarm(
+            payload.deviceName, door_bool, payload.floor, ts_ms, x_account_id
+        )
 
         logger.info(f"[RESULT] {payload.deviceName} alarms_triggered={len(triggered)}")
         return {"status": "processed", "alarms_triggered": triggered}
