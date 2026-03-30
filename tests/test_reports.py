@@ -6,11 +6,15 @@ def test_report_allows_new_rule_chain_keys():
         {
             "deviceName": "N_B1_L07",
             "dataTypes": [
+                "height_cm",
                 "temperature",
                 "humidity",
                 "door_open",
                 "sound_db",
                 "laser_distance",
+                "accX",
+                "accY",
+                "accZ",
                 "microphone_peak_dB",
                 "microphone_rms_dB",
                 "proximity",
@@ -29,11 +33,15 @@ def test_report_allows_new_rule_chain_keys():
     )
 
     assert model.data_types == [
+        "height_cm",
         "temperature",
         "humidity",
         "door_open",
         "sound_db",
         "laser_distance",
+        "accX",
+        "accY",
+        "accZ",
         "microphone_peak_dB",
         "microphone_rms_dB",
         "proximity",

@@ -5,6 +5,7 @@ from typing import Any, List
 from pydantic import BaseModel, Field, field_validator
 
 ALLOWED_TYPES = {
+    "height_cm",
     "height",
     "direction",
     "lift_status",
@@ -21,6 +22,9 @@ ALLOWED_TYPES = {
     "humidity",
     "sound_db",
     "laser_distance",
+    "accX",
+    "accY",
+    "accZ",
     "microphone_peak_dB",
     "microphone_rms_dB",
     "proximity",
