@@ -24,3 +24,9 @@ class AlarmTelemetryPayload(BaseModel):
 
     door_open: Optional[Union[bool, str, int]] = Field(default=None)
     sound_db: Optional[Union[float, str]] = Field(default=None)
+    batterySoC: Optional[Union[float, str]] = Field(default=None)
+
+    # Raw passthrough fields retained for compatibility/debug from rule-chain output.
+    microphone_peak_dB: Optional[Union[float, str]] = Field(default=None)
+    microphone_rms_dB: Optional[Union[float, str]] = Field(default=None)
+    proximity: Optional[Union[float, str, int, bool]] = Field(default=None)

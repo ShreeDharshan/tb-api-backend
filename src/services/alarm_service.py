@@ -22,7 +22,8 @@ THRESHOLDS: Dict[str, float] = {
     "x_vibe": 5.0,
     "y_vibe": 5.0,
     "z_vibe": 15.0,
-    "sound_db": 80.0,
+    "sound_db": 60.0,
+    "batterySoC": 20.0,
 }
 
 ZONE_MM = 2000.0
@@ -337,11 +338,12 @@ def process_alarm_payload(payload: AlarmTelemetryPayload, account_id: str) -> Di
     triggered: List[Dict[str, Any]] = []
 
     try:
-        for key in ("humidity", "temperature"):
+        for key in ("humidity", "temperature", "sound_db"):
             value = parse_float(getattr(payload, key))
             if value is not None and key in THRESHOLDS and value > THRESHOLDS[key]:
+                alarm_name = "Sound Alarm" if key == "sound_db" else f"{key.capitalize()} Alarm"
                 summary = {
-                    "type": f"{key.capitalize()} Alarm",
+                    "type": alarm_name,
                     "value": value,
                     "threshold": THRESHOLDS[key],
                     "severity": "WARNING",
@@ -361,7 +363,31 @@ def process_alarm_payload(payload: AlarmTelemetryPayload, account_id: str) -> Di
                     account_id,
                 )
 
-        for key in ("x_jerk", "y_jerk", "z_jerk", "x_vibe", "y_vibe", "z_vibe", "sound_db"):
+        battery_soc = parse_float(payload.batterySoC)
+        battery_threshold = THRESHOLDS.get("batterySoC")
+        if battery_soc is not None and battery_threshold is not None and battery_soc < battery_threshold:
+            summary = {
+                "type": "Battery Low Alarm",
+                "value": battery_soc,
+                "threshold": battery_threshold,
+                "severity": "MAJOR",
+                "floor": payload.floor,
+            }
+            triggered.append(summary)
+            _create_alarm_on_tb(
+                payload.deviceName,
+                summary["type"],
+                ts_ms,
+                "MAJOR",
+                {
+                    "batterySoC": battery_soc,
+                    "threshold": battery_threshold,
+                    "floor": payload.floor,
+                },
+                account_id,
+            )
+
+        for key in ("x_jerk", "y_jerk", "z_jerk", "x_vibe", "y_vibe", "z_vibe"):
             value = parse_float(getattr(payload, key))
             threshold = THRESHOLDS.get(key)
             if value is not None and threshold is not None and value > threshold:
