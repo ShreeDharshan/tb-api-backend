@@ -69,3 +69,30 @@ def test_calculated_telemetry_keeps_idle_streak_start_stable(monkeypatch):
     calculated = final["calculated"]
     assert calculated["idle_home_streak"] == 6
     assert calculated["total_idle_home_seconds"] == 6
+
+
+def test_calculated_telemetry_uses_payload_home_floor(monkeypatch):
+    monkeypatch.setenv("TB_ACCOUNTS", '{"account1":"https://thingsboard.cloud"}')
+    _reset_telemetry_state()
+
+    base = {
+        "deviceName": "N_B1_L07",
+        "device_token": "token-3",
+        "current_floor_index": 2,
+        "home_floor": 2,
+        "lift_status": "Idle",
+        "door_open": False,
+    }
+
+    telemetry_service.process_calculated_telemetry(
+        CalculatedTelemetryPayload(**(base | {"ts": 300_000})),
+        "account1",
+    )
+    final = telemetry_service.process_calculated_telemetry(
+        CalculatedTelemetryPayload(**(base | {"ts": 305_000})),
+        "account1",
+    )
+
+    calculated = final["calculated"]
+    assert calculated["idle_home_streak"] == 5
+    assert calculated["idle_outside_home_streak"] == 0

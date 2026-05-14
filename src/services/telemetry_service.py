@@ -14,6 +14,16 @@ _floor_door_counts: Dict[str, Dict[int, int]] = {}
 _floor_door_durations: Dict[str, Dict[int, int]] = {}
 
 
+def _parse_home_floor(value: Any) -> int:
+    try:
+        if value is None or value == "":
+            return 1
+        return int(value)
+    except (TypeError, ValueError):
+        logger.warning("Invalid home_floor=%r; falling back to 1", value)
+        return 1
+
+
 def process_calculated_telemetry(payload: CalculatedTelemetryPayload, account_id: str) -> dict:
     accounts = parse_tb_accounts()
     if account_id not in accounts:
@@ -44,7 +54,7 @@ def process_calculated_telemetry(payload: CalculatedTelemetryPayload, account_id
         _floor_door_durations[device_key] = {}
 
     state = _device_state[device_key]
-    home_floor = 1
+    home_floor = _parse_home_floor(payload.home_floor)
 
     is_idle = (payload.lift_status.lower() == "idle") or bool(payload.door_open)
 
