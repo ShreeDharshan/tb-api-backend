@@ -1,7 +1,7 @@
 import logging
 import time
 from datetime import datetime
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Dict, Optional, Union
 
 import requests
 from fastapi import HTTPException
@@ -13,25 +13,18 @@ from src.models.alarm import AlarmTelemetryPayload
 logger = logging.getLogger("services.alarm")
 
 THRESHOLDS: Dict[str, float] = {
-    "humidity": 50.0,
-    "temperature": 50.0,
-    "x_jerk": 5.0,
-    "y_jerk": 5.0,
-    "z_jerk": 15.0,
-    "x_vibe": 5.0,
-    "y_vibe": 5.0,
-    "z_vibe": 15.0,
-    "sound_db": 60.0,
+    "humidity": 30.0,
+    "temperature": 30.0,
+    "sound_db": 45.0,
     "batterySoC_low": 20.0,
+    "vibration_delta_strong": 0.08,
+    "vibration_delta_shock": 0.15,
 }
 
-BUCKET_HALF_WIDTH_CM = 5.0
-BUCKET_COUNT_THRESHOLD = 3
 DOOR_OPEN_THRESHOLD_SEC = 15
 HTTP_TIMEOUT = 12
 
 _device_cache: Dict[str, str] = {}
-_bucket_counts: Dict[str, Dict[str, List[Dict[str, Any]]]] = {}
 _device_door_state: Dict[str, bool] = {}
 _door_open_since: Dict[str, float] = {}
 
@@ -176,56 +169,6 @@ def _create_alarm_on_tb(
         logger.error("[ALARM] Exception: %s", exc)
 
 
-def _check_bucket_and_trigger(
-    device: str,
-    key: str,
-    value: float,
-    height_cm: Optional[float],
-    ts_ms: int,
-    floor: str,
-    account_id: str,
-) -> Optional[Dict[str, Any]]:
-    if height_cm is None:
-        return None
-
-    if device not in _bucket_counts:
-        _bucket_counts[device] = {}
-    if key not in _bucket_counts[device]:
-        _bucket_counts[device][key] = []
-
-    buckets = _bucket_counts[device][key]
-    for bucket in buckets:
-        if abs(bucket["center"] - height_cm) <= BUCKET_HALF_WIDTH_CM:
-            bucket["count"] += 1
-            if bucket["count"] >= BUCKET_COUNT_THRESHOLD:
-                alarm_type = f"{key} Alarm"
-                details = {
-                    "value": value,
-                    "threshold": THRESHOLDS[key],
-                    "floor": floor,
-                    "height_zone": (
-                        f"{bucket['center'] - BUCKET_HALF_WIDTH_CM:.1f} to "
-                        f"{bucket['center'] + BUCKET_HALF_WIDTH_CM:.1f} cm"
-                    ),
-                    "count": bucket["count"],
-                }
-                _create_alarm_on_tb(device, alarm_type, ts_ms, "MINOR", details, account_id)
-                buckets.remove(bucket)
-                return {
-                    "type": alarm_type,
-                    "value": value,
-                    "threshold": THRESHOLDS[key],
-                    "severity": "MINOR",
-                    "floor": floor,
-                    "height_zone": details["height_zone"],
-                    "count": bucket["count"],
-                }
-            return None
-
-    buckets.append({"center": height_cm, "count": 1})
-    return None
-
-
 def _process_door_alarm(
     device_name: str,
     door_open_input: Optional[bool],
@@ -259,6 +202,77 @@ def _process_door_alarm(
         _door_open_since.pop(device_name, None)
 
 
+def _vibration_details(
+    payload: AlarmTelemetryPayload,
+    value: Optional[float],
+    threshold: float,
+    height_cm: Optional[float],
+) -> Dict[str, Any]:
+    details = {
+        "value": value,
+        "threshold": threshold,
+        "floor": payload.floor,
+        "vibration_level": payload.vibration_level,
+        "is_vibrating": parse_bool(payload.is_vibrating),
+        "height_cm": height_cm,
+    }
+
+    for key in (
+        "acc_total_ms2",
+        "acc_total_g",
+        "prev_acc_total_g",
+        "accX",
+        "accY",
+        "accZ",
+        "x_vibe",
+        "y_vibe",
+        "z_vibe",
+    ):
+        parsed = parse_float(getattr(payload, key))
+        if parsed is not None:
+            details[key] = parsed
+
+    return {key: value for key, value in details.items() if value is not None}
+
+
+def _process_vibration_alarm(
+    payload: AlarmTelemetryPayload,
+    height_cm: Optional[float],
+    ts_ms: int,
+    account_id: str,
+) -> Optional[Dict[str, Any]]:
+    delta_g = parse_float(payload.vibration_delta_g)
+    vibration_alert = parse_bool(payload.VibrationAlert)
+    shock_threshold = THRESHOLDS["vibration_delta_shock"]
+    strong_threshold = THRESHOLDS["vibration_delta_strong"]
+
+    if delta_g is not None and delta_g > shock_threshold:
+        alarm_type = "Vibration Shock Alarm"
+        severity = "MAJOR"
+        threshold = shock_threshold
+    elif vibration_alert is True:
+        alarm_type = "Vibration Shock Alarm"
+        severity = "MAJOR"
+        threshold = shock_threshold
+    elif delta_g is not None and delta_g > strong_threshold:
+        alarm_type = "Vibration Strong Alarm"
+        severity = "WARNING"
+        threshold = strong_threshold
+    else:
+        return None
+
+    details = _vibration_details(payload, delta_g, threshold, height_cm)
+    _create_alarm_on_tb(payload.deviceName, alarm_type, ts_ms, severity, details, account_id)
+    return {
+        "type": alarm_type,
+        "value": delta_g,
+        "threshold": threshold,
+        "severity": severity,
+        "floor": payload.floor,
+        "vibration_level": payload.vibration_level,
+    }
+
+
 def process_alarm_payload(payload: AlarmTelemetryPayload, account_id: str) -> Dict[str, Any]:
     accounts = _accounts()
     if account_id not in accounts:
@@ -273,7 +287,7 @@ def process_alarm_payload(payload: AlarmTelemetryPayload, account_id: str) -> Di
     if door_bool is None:
         door_bool = _device_door_state.get(payload.deviceName, False)
 
-    triggered: List[Dict[str, Any]] = []
+    triggered: list[dict[str, Any]] = []
 
     try:
         for key in ("humidity", "temperature", "sound_db"):
@@ -334,21 +348,9 @@ def process_alarm_payload(payload: AlarmTelemetryPayload, account_id: str) -> Di
                 account_id,
             )
 
-        for key in ("x_jerk", "y_jerk", "z_jerk", "x_vibe", "y_vibe", "z_vibe"):
-            value = parse_float(getattr(payload, key))
-            threshold = THRESHOLDS.get(key)
-            if value is not None and threshold is not None and value > threshold:
-                bucket_alarm = _check_bucket_and_trigger(
-                    payload.deviceName,
-                    key,
-                    value,
-                    height_cm,
-                    ts_ms,
-                    payload.floor,
-                    account_id,
-                )
-                if bucket_alarm is not None:
-                    triggered.append(bucket_alarm)
+        vibration_alarm = _process_vibration_alarm(payload, height_cm, ts_ms, account_id)
+        if vibration_alarm is not None:
+            triggered.append(vibration_alarm)
 
         _process_door_alarm(payload.deviceName, door_bool, payload.floor, ts_ms, account_id)
 

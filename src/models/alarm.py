@@ -11,11 +11,26 @@ class AlarmTelemetryPayload(BaseModel):
     height_cm: Optional[Union[float, str]] = Field(default=None)
     height: Optional[Union[float, str]] = Field(default=None)
     current_floor_index: Optional[Union[int, str]] = Field(default=None)
+    current_floor_label: Optional[str] = Field(default=None)
+    direction: Optional[str] = Field(default=None)
+    lift_status: Optional[str] = Field(default=None)
 
+    accX: Optional[Union[float, str]] = Field(default=None)
+    accY: Optional[Union[float, str]] = Field(default=None)
+    accZ: Optional[Union[float, str]] = Field(default=None)
     x_vibe: Optional[Union[float, str]] = Field(default=None)
     y_vibe: Optional[Union[float, str]] = Field(default=None)
     z_vibe: Optional[Union[float, str]] = Field(default=None)
 
+    acc_total_ms2: Optional[Union[float, str]] = Field(default=None)
+    acc_total_g: Optional[Union[float, str]] = Field(default=None)
+    prev_acc_total_g: Optional[Union[float, str]] = Field(default=None)
+    vibration_delta_g: Optional[Union[float, str]] = Field(default=None)
+    vibration_level: Optional[str] = Field(default=None)
+    is_vibrating: Optional[Union[bool, int, str]] = Field(default=None)
+
+    # Legacy fields retained for older rule-chain payloads. The current rule chain uses
+    # vibration_delta_g as the canonical vibration signal.
     x_jerk: Optional[Union[float, str]] = Field(default=None)
     y_jerk: Optional[Union[float, str]] = Field(default=None)
     z_jerk: Optional[Union[float, str]] = Field(default=None)

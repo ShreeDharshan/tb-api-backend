@@ -3,7 +3,6 @@ import src.services.alarm_service as alarm_service
 
 def _reset_alarm_state() -> None:
     alarm_service._device_cache.clear()
-    alarm_service._bucket_counts.clear()
     alarm_service._device_door_state.clear()
     alarm_service._door_open_since.clear()
 
@@ -105,7 +104,7 @@ def test_check_alarm_triggers_battery_low_alarm(client, monkeypatch):
     assert battery_creates[0]["severity"] == "MAJOR"
 
 
-def test_check_alarm_height_fallback_field_treated_as_cm(client, monkeypatch):
+def test_check_alarm_triggers_vibration_strong_alarm_from_delta(client, monkeypatch):
     monkeypatch.setenv("TB_ACCOUNTS", '{"account1":"https://thingsboard.cloud"}')
     _reset_alarm_state()
 
@@ -125,32 +124,114 @@ def test_check_alarm_height_fallback_field_treated_as_cm(client, monkeypatch):
 
     monkeypatch.setattr(alarm_service, "_create_alarm_on_tb", fake_create)
 
-    base_payload = {
-        "deviceName": "N_B1_L07",
-        "floor": "2",
-        "timestamp": 1736055123000,
-        "height": 123.4,
-        "current_floor_index": 3,
-        "x_vibe": 6.0,
-    }
-
-    first = client.post("/check_alarm/", headers={"X-Account-ID": "account1"}, json=base_payload)
-    second = client.post(
+    response = client.post(
         "/check_alarm/",
         headers={"X-Account-ID": "account1"},
-        json={**base_payload, "height": 127.9},
+        json={
+            "deviceName": "N_B1_L07",
+            "floor": "Ground",
+            "timestamp": 1736055123000,
+            "height_cm": 151.2,
+            "current_floor_index": 1,
+            "acc_total_g": 0.6878,
+            "prev_acc_total_g": 0.6,
+            "vibration_delta_g": 0.0878,
+            "vibration_level": "strong",
+            "is_vibrating": True,
+        },
     )
-    third = client.post(
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["alarms_triggered"] == [
+        {
+            "type": "Vibration Strong Alarm",
+            "value": 0.0878,
+            "threshold": 0.08,
+            "severity": "WARNING",
+            "floor": "Ground",
+            "vibration_level": "strong",
+        }
+    ]
+
+    assert len(created) == 1
+    assert created[0]["alarm_type"] == "Vibration Strong Alarm"
+    assert created[0]["severity"] == "WARNING"
+    assert created[0]["details"]["value"] == 0.0878
+    assert created[0]["details"]["acc_total_g"] == 0.6878
+
+
+def test_check_alarm_triggers_vibration_shock_alarm_from_delta(client, monkeypatch):
+    monkeypatch.setenv("TB_ACCOUNTS", '{"account1":"https://thingsboard.cloud"}')
+    _reset_alarm_state()
+
+    created = []
+
+    def fake_create(device_name, alarm_type, ts_ms, severity, details, account_id):
+        created.append(
+            {
+                "device_name": device_name,
+                "alarm_type": alarm_type,
+                "ts_ms": ts_ms,
+                "severity": severity,
+                "details": details,
+                "account_id": account_id,
+            }
+        )
+
+    monkeypatch.setattr(alarm_service, "_create_alarm_on_tb", fake_create)
+
+    response = client.post(
         "/check_alarm/",
         headers={"X-Account-ID": "account1"},
-        json={**base_payload, "height": 119.5},
+        json={
+            "deviceName": "N_B1_L07",
+            "floor": "Ground",
+            "timestamp": 1736055123000,
+            "height_cm": 151.2,
+            "current_floor_index": 1,
+            "acc_total_g": 0.6878,
+            "prev_acc_total_g": 0.5,
+            "vibration_delta_g": 0.1878,
+            "vibration_level": "shock_impact",
+            "is_vibrating": True,
+            "VibrationAlert": True,
+        },
     )
 
-    assert first.status_code == 200
-    assert second.status_code == 200
-    assert third.status_code == 200
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["alarms_triggered"][0]["type"] == "Vibration Shock Alarm"
+    assert payload["alarms_triggered"][0]["severity"] == "MAJOR"
+    assert created[0]["alarm_type"] == "Vibration Shock Alarm"
+    assert created[0]["details"]["threshold"] == 0.15
 
-    payload = third.json()
-    bucket_alarms = [entry for entry in payload["alarms_triggered"] if entry["type"] == "x_vibe Alarm"]
-    assert len(bucket_alarms) == 1
-    assert bucket_alarms[0]["height_zone"].endswith("cm")
+
+def test_check_alarm_does_not_trigger_old_axis_vibe_alarm(client, monkeypatch):
+    monkeypatch.setenv("TB_ACCOUNTS", '{"account1":"https://thingsboard.cloud"}')
+    _reset_alarm_state()
+
+    created = []
+    monkeypatch.setattr(alarm_service, "_create_alarm_on_tb", lambda *args: created.append(args))
+
+    response = client.post(
+        "/check_alarm/",
+        headers={"X-Account-ID": "account1"},
+        json={
+            "deviceName": "N_B1_L07",
+            "floor": "Ground",
+            "timestamp": 1736055123000,
+            "height_cm": 151.2,
+            "current_floor_index": 1,
+            "x_vibe": 8.0,
+            "y_vibe": 8.0,
+            "z_vibe": 16.0,
+            "vibration_delta_g": 0.02,
+            "vibration_level": "stationary",
+            "is_vibrating": False,
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.json()["alarms_triggered"] == []
+    assert created == []
